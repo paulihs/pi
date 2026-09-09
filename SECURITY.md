@@ -1,87 +1,53 @@
-# Security Policy
+# 安全策略
 
-This document should guide you about understanding the security concept behind
-Pi and also where the boundaries are.
+本文用于说明 Pi 背后的安全模型以及安全边界。
 
-In general Pi is a coding agent that runs locally within the security boundary
-of the user that is running it.  It's the responsibility of the user to monitor
-its operations or to contain it within a container, virtual machine or other
-Sandbox solution.
+通常，Pi 是在本地运行的编码 Agent，位于运行它的用户的安全边界内。用户有责任监控 Pi 的操作，或将它放入容器、虚拟机或其他沙箱方案中。
 
-Pi treats the local user account and files writable by that account as inside
-the same trust boundary as the Pi process itself.  If an attacker can modify files
-under the user's home directory, workspace, shell startup files, environment, or
-Pi configuration, they can generally influence Pi or other local developer tools.
-Reports that depend on such prior local write access are not security
-vulnerabilities unless they demonstrate how Pi grants that write access or crosses
-an operating-system privilege boundary.
+Pi 将本地用户账号以及该账号可写的文件视为与 Pi 进程处于同一信任边界内。如果攻击者能够修改用户主目录、工作区、Shell 启动文件、环境或 Pi 配置下的文件，通常就可以影响 Pi 或其他本地开发工具。依赖于这种既有本地写入权限的报告不属于安全漏洞，除非报告证明 Pi 如何授予该写入权限，或如何跨越操作系统权限边界。
 
-Pi relies on users installing trustworthy extensions and loading trustworthy
-skills and only to use pi within trusted repositories.  This is because files
-like `AGENTS.md` or instructions in comments can be used to prompt inject the
-coding agent trivially and this cannot be protected against.
+Pi 依赖用户安装可信的扩展、加载可信的 Skill，并且只在可信仓库中使用 pi。这是因为 `AGENTS.md` 之类的文件或代码注释中的指令可以轻易对编码 Agent 实施 Prompt 注入，而这类风险无法完全防护。
 
-## Reporting a Vulnerability
+## 报告漏洞
 
-If you believe you found a security vulnerability in pi or another package in
-this repository, please report it privately by either:
+如果你认为在 pi 或本仓库的其他包中发现了安全漏洞，请通过以下任一方式私下报告：
 
-- Emailing `security@earendil.com`, or
-- Opening a private report through GitHub Security Advisories for this repository
+- 发送邮件至 `security@earendil.com`；或
+- 通过本仓库的 GitHub Security Advisories 创建私密报告
 
-Please include:
+请包含：
 
-- A description of the issue and its impact
-- Steps to reproduce, proof of concept, or relevant logs
-- Affected package, version, commit, or configuration
-- Any known mitigations
+- 问题描述及其影响
+- 复现步骤、概念验证或相关日志
+- 受影响的包、版本、提交或配置
+- 已知的缓解措施
 
-Do not open a public issue for security-sensitive reports.  We will review
-reports and coordinate disclosure as appropriate.
+不要为涉及安全的报告创建公开 Issue。我们会审查报告，并在适当时协调披露。
 
-## Scope
+## 范围
 
-Security issues in the distributed packages, command-line tools, APIs, and
-repository code are in scope as well as earendil operated infrastructure
-on `pi.dev`.
+分发包、命令行工具、API、仓库代码以及 Earendil 运营的 `pi.dev` 基础设施中的安全问题均属于范围内。
 
-## Out Of Scope
+## 不在范围内
 
-- Local code execution or sandboxing behavior (the Pi coding agent intentionally does not have a sandbox)
-- Behavior of pi extensions or skills installed by the user
-- Risks from working in untrusted repositories
-- Risks from installing untrusted extensions, skills, packages, or tools
-- Isuses caused by non trustworthy MITM proxies
-- Public internet exposure of a Pi installation
-- Prompt injection attacks
-- Exposed secrets that are third-party/user-controlled credentials
-- Reports requiring the ability to create, modify, delete, or replace files,
-  directories, symlinks, environment variables, shell configuration, or other
-  user-controlled local state on the target machine. This includes `~/.pi`,
-  `~/.pi/agent/models.json`, workspace files, `AGENTS.md`, skills, extensions,
-  extension configuration, dotfiles, and files synchronized through NFS, roaming
-  profiles, or dotfile managers, unless the report shows how Pi itself grants
-  that access.
-- Issues caused by intentionally weakened user configuration.
-- Resource/DOS claims that require trusted local input/config against the pi coding agent.
-- Reports about malicious model output.
-- User-approved or user-initiated local actions presented as vulnerabilities.
+- 本地代码执行或沙箱行为（Pi coding agent 有意不提供沙箱）
+- 用户安装的 pi 扩展或 Skill 的行为
+- 在不可信仓库中工作的风险
+- 安装不可信扩展、Skill、包或工具的风险
+- 不可信中间人（MITM）代理导致的问题
+- 将 Pi 安装暴露到公共互联网
+- Prompt 注入攻击
+- 第三方或用户控制凭据的泄露
+- 要求攻击者能够在目标机器上创建、修改、删除或替换文件、目录、符号链接、环境变量、Shell 配置或其他用户控制本地状态的报告。这包括 `~/.pi`、`~/.pi/agent/models.json`、工作区文件、`AGENTS.md`、Skill、扩展、扩展配置、点文件，以及通过 NFS、漫游配置文件或点文件管理器同步的文件；除非报告说明 Pi 本身如何授予了该访问权限。
+- 由有意弱化的用户配置导致的问题
+- 需要针对 pi coding agent 使用可信本地输入或配置的资源耗尽/DoS 声明
+- 关于恶意模型输出的报告
+- 用户批准或主动发起的本地操作被描述为漏洞
 
-## Notes for Reporters
+## 给报告者的说明
 
-The most useful reports show a current, reproducible security boundary bypass
-with demonstrated impact.  Reports that only show expected local-agent behavior,
-prompt injection, or a malicious trusted extension/skill are not security
-vulnerabilities under this model.
+最有价值的报告应展示当前版本中可复现的安全边界绕过，并证明实际影响。仅展示预期的本地 Agent 行为、Prompt 注入或恶意的可信扩展/Skill，在此安全模型下不属于安全漏洞。
 
-For example, a report showing that malicious contents written to a trusted Pi
-configuration file cause Pi to execute commands, load attacker-controlled tools,
-send credentials to an attacker-controlled endpoint, or otherwise change behavior
-is out of scope.
+例如，报告证明恶意内容写入可信 Pi 配置文件后，导致 Pi 执行命令、加载攻击者控制的工具、向攻击者控制的端点发送凭据，或以其他方式改变行为，这仍属于范围外问题。
 
-When possible, include the exact affected path, package version or commit SHA,
-configuration, and a proof of concept against the latest release or latest
-`main`.  For dependency reports, include evidence that the shipped dependency is
-affected and that the issue is reachable through Pi.  For exposed-secret reports,
-include evidence that the credential is owned by Earendil or grants access to
-Earendil-operated infrastructure or services.
+如果可以，请提供确切的受影响路径、包版本或提交 SHA、配置，以及针对最新 Release 或最新 `main` 的概念验证。对于依赖漏洞报告，请提供已发布依赖受影响且该问题可通过 Pi 触达的证据。对于凭据暴露报告，请提供凭据归 Earendil 所有，或能够访问 Earendil 运营的基础设施或服务的证据。

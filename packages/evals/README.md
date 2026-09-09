@@ -1,43 +1,36 @@
 # Pi evals
 
-Pi evals are behavioral, model-backed checks for Pi workflows. They adapt a real `AgentSession` to `vitest-evals`, run
-it in isolated temporary project and agent directories, and attach native Pi session artifacts.
-Use them to measure end-to-end behavior and compare prompts, tools, skills, models, or other harness configurations.
+Pi evals 是面向 Pi 工作流的、由模型驱动的行为检查。它将真实的 `AgentSession` 适配到 `vitest-evals`，在隔离的临时项目和 Agent 目录中运行，并附带原生 Pi 会话产物。
+可以用它测量端到端行为，并比较 Prompt、工具、Skill、模型或其他框架配置。
 
-## Running evals
+## 运行 evals
 
-Run from the repository root with a default provider and model:
+在仓库根目录使用默认供应商和模型运行：
 
 ```bash
 npm run eval -- --provider openai --model gpt-5.6-sol
 ```
 
-The equivalent environment variables are:
+等价的环境变量是：
 
 ```bash
 PI_PROVIDER=openai PI_MODEL=gpt-5.6-sol npm run eval
 ```
 
-CLI values take precedence and become defaults for harnesses that do not select a model explicitly. Provider and model must be supplied together. The runner also allows no default when every executed harness configures its own model.
-Authentication comes from Pi's normal `ModelRuntime`, including Pi subscription credentials and provider API-key
-environment variables.
+CLI 参数优先，并会成为未显式选择模型的框架默认值。供应商和模型必须同时提供。如果每个执行的框架都配置了自己的模型，也可以不提供默认模型。认证来自 Pi 的普通 `ModelRuntime`，包括 Pi 订阅凭据和供应商 API Key 环境变量。
 
-Additional arguments are forwarded to Vitest:
+其他参数会转发给 Vitest：
 
 ```bash
 npm run eval -- src/extensions.eval.ts
 npm run eval -- -t "creates, reloads, and uses"
 ```
 
-Each invocation prints an ignored `.eval/` artifact directory. `runs.jsonl` indexes completed harness runs and their
-native Pi session JSONL attachments under `sessions/`. These files may contain prompts, responses, source code, and tool
-output.
+每次执行都会打印一个被忽略的 `.eval/` 产物目录。`runs.jsonl` 会索引已完成的框架运行，以及 `sessions/` 下附带的原生 Pi 会话 JSONL。这些文件可能包含 Prompt、响应、源代码和工具输出。
 
-## Writing evals
+## 编写 evals
 
-Follow [`vitest-evals`](https://github.com/getsentry/vitest-evals) for general suite, judge, assertion, and normalized
-trace guidance. Pi-specific evals use `createPiCodingAgentHarness(...)` from `src/pi-harness.ts`, with one harness bound
-to each `describeEval(...)` suite:
+通用测试套件、评判器、断言和规范化轨迹指南请遵循 [`vitest-evals`](https://github.com/getsentry/vitest-evals)。Pi 专用 eval 使用 `src/pi-harness.ts` 中的 `createPiCodingAgentHarness(...)`，每个 `describeEval(...)` 测试套件绑定一个框架：
 
 ```ts
 import { expect } from "vitest";
@@ -54,17 +47,17 @@ describeEval("Pi smoke", { harness }, (it) => {
 });
 ```
 
-### Configuring the Pi harness
+### 配置 Pi 框架
 
-`createPiCodingAgentHarness(...)` accepts:
+`createPiCodingAgentHarness(...)` 接受：
 
-- `name`: stable harness identity used by reports and comparisons.
-- `model`: optional `{ provider, id }` selection. It overrides the runner's default model.
-- `noTools`: Pi's tool-disable configuration.
-- `transformSystemPrompt`: transforms the complete default prompt before the eval starts.
-- `output`: transforms the final response and `AgentSession` into a JSON-safe domain result.
+- `name`：用于报告和比较的稳定框架标识。
+- `model`：可选的 `{ provider, id }` 选择，会覆盖运行器的默认模型。
+- `noTools`：Pi 的工具禁用配置。
+- `transformSystemPrompt`：在 eval 开始前转换完整的默认 Prompt。
+- `output`：将最终响应和 `AgentSession` 转换为 JSON 安全的领域结果。
 
-An explicitly selected model makes model-comparison harnesses independent of the runner default:
+显式选择模型后，模型比较框架就不再依赖运行器默认模型：
 
 ```ts
 const harness = createPiCodingAgentHarness({
@@ -73,8 +66,7 @@ const harness = createPiCodingAgentHarness({
 });
 ```
 
-A run accepts either one prompt or a sequence of prompt and reload steps. Reload steps are useful when the preceding
-prompt creates or changes Pi resources:
+一次运行可以接受单个 Prompt，也可以接受 Prompt 与 reload 步骤序列。当之前的 Prompt 创建或修改了 Pi 资源时，reload 步骤很有用：
 
 ```ts
 const result = await run([
@@ -84,9 +76,9 @@ const result = await run([
 ]);
 ```
 
-### Transforming harness output
+### 转换框架输出
 
-Use `output` to expose scenario-specific, JSON-safe behavior without adding that behavior to the generic Pi adapter:
+使用 `output` 暴露场景特有且 JSON 安全的行为，无需把这些行为加入通用 Pi 适配器：
 
 ```ts
 const harness = createPiCodingAgentHarness({
@@ -98,10 +90,9 @@ const harness = createPiCodingAgentHarness({
 });
 ```
 
-Assert application behavior on `result.output`. Assert model and tool traces on `result.session`, using
-`vitest-evals` helpers such as `toolCalls(...)`.
+使用 `result.output` 断言应用行为。使用 `result.session` 断言模型和工具轨迹，可以使用 `toolCalls(...)` 等 `vitest-evals` 辅助函数。
 
-### Writing comparative eval sets
+### 编写比较型 eval 集合
 
 Use `evalHarnessTable(...)` with Vitest's native `describe.for(...)` to run the same inputs against multiple harnesses.
 Harnesses may differ by prompt, tools, skills, model, or any other Pi configuration:
@@ -133,21 +124,10 @@ describe.for(harnessTable)("$name repetition $repetition", ({ harness }) => {
 });
 ```
 
-Comparative suites should record correctness with deterministic or model-backed judges and set `judgeThreshold: null`.
-This keeps a low score as an observation instead of making the Vitest invocation fail. Use hard assertions only for
-suite invariants and infrastructure contracts. `expect.soft(...)` still fails the test and is not a scoring mechanism.
+比较型测试套件应使用确定性评判器或模型评判器记录正确性，并设置 `judgeThreshold: null`。这样低分会作为观测结果保留，而不会让 Vitest 执行失败。硬断言只用于测试套件不变量和基础设施契约。`expect.soft(...)` 仍会使测试失败，不能作为评分机制。
 
-The Pi harness snapshots native session JSONL before deleting its temporary workspace. An eval-only `afterEach` hook
-registers that snapshot against the explicit Vitest test task before reporters run.
+Pi 框架会在删除临时工作区前保存原生会话 JSONL 快照。仅用于 eval 的 `afterEach` Hook 会在报告器运行前，将该快照注册到明确的 Vitest 测试任务上。
 
-Harness names must be stable and unique within an eval set. The grouping key combines repetition with a non-empty string
-`input.id` when available, otherwise with a SHA-256 hash of strict canonical JSON input. Use `candidate` for one treatment
-or `candidates` for multiple treatments. Each candidate is compared only with the declared baseline. For each matched
-input and repetition, the reporter computes pass-rate lift from each run's recorded average judge score, treating a score
-of at least `1` as passing. Lift is the candidate pass rate minus the baseline pass rate, in percentage points. Missing
-judge scores are reported as incomplete observations. Tokens, latency, and estimated cost remain separate
-candidate-minus-baseline paired deltas; missing telemetry remains unavailable. If execution-order randomization becomes
-necessary, use Vitest's built-in sequence shuffling.
+框架名称在一个 eval 集合中必须稳定且唯一。分组键优先将重复次数与非空字符串 `input.id` 组合；如果没有 `input.id`，则使用严格规范化 JSON 输入的 SHA-256 哈希。单个处理使用 `candidate`，多个处理使用 `candidates`。每个候选项只与声明的基线比较。对于每个匹配的输入和重复项，报告器根据每次运行记录的平均评判分数计算通过率提升，并将分数至少为 `1` 视为通过。提升值是候选项通过率减去基线通过率，单位为百分点。缺失的评判分数会报告为不完整观测。Token、延迟和估算成本仍作为候选项减基线的配对差值单独记录；缺失的遥测数据保持不可用。如果确实需要随机化执行顺序，请使用 Vitest 内置的序列打乱功能。
 
-See the [`skill-eval-harness`](https://github.com/adewale/skill-eval-harness/) guidance for comparative-eval methodology,
-repetition strategy, trustworthy judges, and telemetry interpretation.
+关于比较型 eval 方法、重复策略、可信评判器和遥测数据解读，请参阅 [`skill-eval-harness`](https://github.com/adewale/skill-eval-harness/) 指南。
