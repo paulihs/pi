@@ -1,130 +1,92 @@
-# Tool durability — implementation handoff
+# Tool durability — 实现 handoff
 
-This document specifies the durable tool-call lifecycle and the minimal harness-specific progress-checkpoint extension to the current tool API. It does not otherwise finalize the harness-native public tool interface; that interface must provide the capabilities required here without exposing raw session storage.
+本文规定 durable tool-call lifecycle，以及当前 tool API 的最小 harness 专用 progress-checkpoint 扩展。不在此最终确定 harness-native public tool interface；该接口必须提供所需 capability，但不能暴露原始 Session storage。
 
-The design has two independent additions:
+本设计有两个独立增加项：
 
-1. a durable `outcome_ready` state between external-effect settlement and source-ordered conversation placement;
-2. opt-in durable replacement checkpoints for complete bounded `onUpdate` snapshots.
+1. 外部 effect settlement 与 source-order conversation placement 之间的 durable outcome_ready 状态；
+2. 可选的、对完整有界 onUpdate snapshot 的 durable replacement checkpoint。
 
-## Problem
+## 问题
 
-Parallel tool effects finish in completion order, while tool-result entries must enter the conversation in assistant source order.
+并行 tool effect 按完成顺序结束，但 tool-result entry 必须按 assistant source order 进入 conversation。若没有中间 durable state，B/C 可能已经完成却只存在进程内，A 阻塞 placement 后崩溃，恢复会错误地重跑或中断已完成的 effect。
 
-Without an intermediate durable state:
+解决方案拆分两种顺序：
 
-```text
-calls: A, B, C
-B finishes
-C finishes
-A is still running
-process crashes
-```
+1. outcome durability：实际完成顺序；
+2. entry materialization：assistant 源码顺序。
 
-B and C exist only in process memory because A prevented source-ordered placement. Recovery treats them as unresolved and may replay or interrupt effects that already completed.
+完整最终结果立即写入 pi.pending.entry，call 变为 outcome_ready；等更早 source position 都 complete/ready 后再 placement。
 
-The solution separates two orders:
+## 目标
 
-1. **outcome durability:** actual completion order;
-2. **entry materialization:** assistant source order.
+1. 完整最终 outcome durable 后不再重跑 tool；
+2. 持久化 out-of-order parallel outcome，同时保持 transcript 顺序；
+3. 保留 replay: "safe" | "never"；
+4. 支持 Flue 风格 step.do 的 invocation-scoped memo；
+5. 保留 reconnect 和 unsafe interruption recovery 所需的 bounded progress checkpoint；
+6. 在 outcome settlement、cancellation 或 external finalization 后 fence late write；
+7. 最终 tree entry canonical、完整、有界且 immutable。
 
-A complete finalized result becomes durable immediately in `pi.pending.entry`; the call becomes `outcome_ready`; placement happens later when every earlier source position is complete or ready.
+## 非目标
 
-## Goals
+不保证任意外部 effect exactly-once；不为每个 step.do 建独立 durable state machine；不从 progress 推断 completion；不把 partial output 当最终结果；不向 tool 暴露 raw Session/SessionMutator/storage address；不在本文最终确定 public harness-native tool type。
 
-1. Never rerun a tool after its complete finalized outcome is durable.
-2. Durably retain out-of-order parallel outcomes without violating transcript order.
-3. Preserve the existing whole-tool `replay: "safe" | "never"` contract.
-4. Support invocation-scoped durable memoization for Flue-style `step.do`.
-5. Preserve tool-selected bounded progress checkpoints for reconnect and unsafe interruption recovery.
-6. Fence late tool writes after outcome settlement, cancellation, or external finalization.
-7. Keep final tree entries canonical, complete, bounded independently of progress snapshots, and immutable.
+## Durable identity
 
-## Non-goals
+每个 call 在执行前已经预留 result entry ID，并将其作为稳定 public invocation identity：
 
-- Exactly-once arbitrary external effects.
-- A nested durable state machine for each `step.do` call.
-- Inferring tool completion from progress output.
-- Treating partial output as the canonical final result.
-- Giving tools raw `Session`, `SessionMutator`, or bound storage-address access.
-- Finalizing the public harness-native tool type in this document.
-
-## Durable identities
-
-Each call already reserves its result entry ID before execution. Use that as the stable public invocation identity:
-
-```text
+~~~text
 invocationId = resultEntryId
-```
+~~~
 
-It is session-unique, survives safe replay, and is distinct from the provider's batch-local `toolCallId`, which a later assistant message may reuse.
-
-The surrounding operation state continues to provide:
-
-- `operationId`;
-- `turnId`/generation step ID;
-- `sourceIndex`;
-- assistant entry ID;
-- captured configuration and execution mode.
+它跨 safe replay 保持稳定，但与 provider 的 batch-local toolCallId 不同。外层 operation state 继续提供 operationId、turn/generation step ID、sourceIndex、assistant entry ID、captured config 和 execution mode。
 
 ## Storage
 
 ### Existing bound values
 
-```ts
-operationToolArgs(operationId, turnId, sourceIndex)
-// Effective validated arguments, persisted before effect admission.
+operationToolArgs(operationId, turnId, sourceIndex) 保存 effect admission 前的有效参数；pendingEntry(resultEntryId) 保存等待 placement 的完整最终 ToolResultMessage。
 
-pendingEntry(resultEntryId)
-// Complete finalized ToolResultMessage while outcome_ready awaits placement.
-```
+### Invocation memo
 
-### Invocation memos
+session/values.ts 定义 operation-owned address：
 
-Define the operation-owned address constructor in `session/values.ts`:
-
-```ts
+~~~ts
 export const operationToolMemo = (
   operationId: string,
   invocationId: string,
   memoName: string,
 ) => value<JsonValue>(
   "pi.op.tool_memo",
-  `${operationId}:${invocationId}:${memoName}`,
+  operationId + ":" + invocationId + ":" + memoName,
 );
-```
+~~~
 
-`memoName` must be non-empty and contain no `:`. Names may use dots or slashes for application-local grouping. `setMemo(name, undefined)` deletes the exact bound value.
-
-`scanValues(operationToolMemoPrefix(operationId))` permits defensive operation cleanup. `scanValues(operationToolMemoPrefix(operationId, invocationId))` permits atomic invocation cleanup when one outcome becomes ready. Core cleanup uses these owner-defined prefix constructors rather than repeating raw reserved namespace/key grammar.
+memoName 非空且不能含冒号，可用点或斜杠分组。setMemo(name, undefined) 删除精确地址。operation cleanup 可用 operationToolMemoPrefix 扫描，单次 outcome 可扫描 invocation 前缀。
 
 ### Partial tool output
 
-The durable recovery value is the latest complete bounded progress snapshot selected by the tool. That is total current state, so use one bound value address:
+durable recovery value 是工具选择的最新完整有界 progress snapshot，使用一个 bound value：
 
-```ts
+~~~ts
 export const pendingToolOutput = (
   operationId: string,
   invocationId: string,
 ) => value<AgentToolResult<unknown>>(
   "pi.pending.tool_output",
-  `${operationId}:${invocationId}`,
+  operationId + ":" + invocationId,
 );
-```
+~~~
 
-This is auxiliary observation data. It never proves the effect succeeded or completed. The stored value has exactly the same content/details/usage shape as the live `partialResult`; recovery does not need a tool-specific progress codec.
-
-The tool owns snapshot bounding, checkpoint cadence, and duplicate suppression. The harness owns synchronous enqueue, promise tracking, invocation fencing, and cleanup. The first API has no generic byte cap and does not truncate or reinterpret typed tool data; in-process tools are trusted to honor the bounded-snapshot contract. There is no tool-visible `flush()` method and no durable list of progress updates.
-
-A crash may lose live updates newer than the latest committed checkpoint. JSONL physical growth is proportional to the size and frequency of distinct requested checkpoints until compaction; Memory and SQLite retain one current value. At 50 KiB every two seconds, JSONL's uncompacted worst case is approximately 15 MiB per ten minutes of continuously changing output.
+它只用于 observation，不能证明 effect 成功/完成；内容/details/usage 与 live partialResult 相同。工具负责 snapshot 上限、checkpoint cadence 和 duplicate suppression；harness 负责同步 enqueue、promise tracking、invocation fence 和 cleanup。没有通用 byte cap、flush method 或 progress list。崩溃可能丢失最近 checkpoint 之后的 live update；Memory/SQLite 保留一个当前值，JSONL 在 compaction 前会按 checkpoint 大小/频率增长。
 
 ## Tool update API
 
-Keep the existing full-snapshot update callback and add harness-specific options:
+保留 full-snapshot update callback，增加 harness 专用 options：
 
-```ts
+~~~ts
 export interface AgentHarnessToolUpdateOptions {
-  /** Request replacement of this invocation's durable recovery checkpoint. */
   checkpoint?: true;
 }
 
@@ -132,573 +94,280 @@ export type AgentHarnessToolUpdateCallback<TDetails> = (
   partialResult: AgentToolResult<TDetails>,
   options?: AgentHarnessToolUpdateOptions,
 ) => void;
-```
+~~~
 
-`AgentHarnessTool` uses this callback instead of the legacy `AgentToolUpdateCallback`. The harness always supplies it, even without a live listener, because a tool may request persistence through it. The legacy `AgentTool` and old agent loop remain unchanged because they cannot honor durable checkpoints.
+harness 总是提供该 callback，即使没有 live listener；checkpoint:true 只是请求持久化，不是 acknowledgement。每次调用仍立即发布 live update 并返回 void。
 
-Every callback invocation remains an immediate live update. The callback is synchronous and returns `void`; `checkpoint: true` additionally requests persistence of that complete snapshot. It is not a durability acknowledgement. Internally, the harness retains the latest `events.emit(tool_update)` promise so existing listener delivery completes before `after_tool`; tools do not await or receive that promise.
-
-Every `checkpoint:true` call synchronously enqueues one scalar replacement on the Session mutation line, attaches the ordinary harness-fault observer to that promise, and replaces the process-local `latestCheckpointWrite` reference. Writes themselves are neither dropped nor coalesced, and replacing the reference never leaves an earlier rejection unobserved:
-
-- Session mutation FIFO preserves request order;
-- each mutation verifies the same call remains `effect_pending`;
-- completion of the latest promise implies completion of every earlier checkpoint write;
-- tool-promise settlement stops accepting updates and awaits that latest promise before `after_tool`;
-- a failed checkpoint commit faults the harness under the ordinary storage-fault rule.
-
-A tool that requests checkpoints faster than storage can queue work in memory. Under the trusted-tool contract, cadence is the tool's responsibility. The built-in bash policy bounds this queue in ordinary use.
-
-Tools should compare against their last requested checkpoint when duplicate suppression matters. Storage does not read and deep-compare the current scalar as part of every checkpoint.
+每个 checkpoint:true 都在 Session mutation line 上同步 enqueue 一次 scalar replacement，绑定 fault observer，并替换 latestCheckpointWrite 引用。写入不 drop、不 coalesce；FIFO、effect_pending fence 和 latest promise 保证顺序。tool settlement 停止接受 update，等待 latest promise；失败的 checkpoint commit 按普通 storage fault 使 harness fault。trusted tool 自行负责 cadence，内置 bash policy 负责限制普通场景下的排队。
 
 ### Bash policy
 
-The built-in bash tool keeps its current 100 ms live update cadence. It requests a checkpoint at most once every two seconds and only when the complete bounded snapshot differs from its last requested checkpoint:
+bash 保持 100 ms live update，最多每两秒请求一次 checkpoint，且完整 snapshot 与上次请求不同：
 
-```ts
+~~~ts
 const BASH_UPDATE_THROTTLE_MS = 100;
 const BASH_CHECKPOINT_INTERVAL_MS = 2_000;
-```
+~~~
 
-The current `ShellCaptureProgress` already supplies a bounded snapshot: the last 2,000 lines or 50 KiB, plus truncation metadata and the overflow-file path. The initial empty update is live-only. Output volume never accelerates checkpoint frequency. A short tool may settle without writing any checkpoint because its complete final result commits instead.
+ShellCaptureProgress 已提供 bounded snapshot：最后 2000 行或 50 KiB，加 truncation metadata 和 overflow path。初始空 update 只 live，不加快 checkpoint；短 tool 可以不写 checkpoint，因为最终结果会完整提交。
 
 ## Tool-call state
 
-Extend the call union with `outcome_ready`:
+ToolCall 增加 outcome_ready：
 
-```ts
+~~~ts
 type ToolCall =
-  | {
-      status: "planned";
-      sourceIndex: number;
-      resultEntryId: string;
-    }
-  | {
-      status: "effect_pending";
-      sourceIndex: number;
-      resultEntryId: string;
-      replay: "never" | "safe";
-    }
-  | {
-      status: "outcome_ready";
-      sourceIndex: number;
-      resultEntryId: string;
-      terminate: boolean;
-    }
-  | {
-      status: "completed";
-      sourceIndex: number;
-      resultEntryId: string;
-      terminate: boolean;
-    };
-```
+  | { status: "planned"; sourceIndex: number; resultEntryId: string }
+  | { status: "effect_pending"; sourceIndex: number; resultEntryId: string; replay: "never" | "safe" }
+  | { status: "outcome_ready"; sourceIndex: number; resultEntryId: string; terminate: boolean }
+  | { status: "completed"; sourceIndex: number; resultEntryId: string; terminate: boolean };
+~~~
 
-`outcome_ready` means:
+outcome_ready 表示 execution/error normalization/after_tool 已结束，或 harness 已生成 synthetic result；完整 ToolResultMessage 已在 pendingEntry；memo 和 partial-output storage 已清理；该 tool 永不再执行；immutable result entry 可能因更早 call 尚未 ready 而暂未存在。不要在 union 中重复最终 payload。
 
-- execution, error normalization, and `after_tool` have finished, or the harness has constructed a final synthetic result;
-- the complete final `ToolResultMessage` exists at `pendingEntry(resultEntryId)`;
-- invocation memos and partial-output storage are gone;
-- the tool must never execute again;
-- the immutable result entry may not exist yet because an earlier call has not materialized.
+## State transition
 
-The exact union may later carry small settlement metadata, but it must not duplicate the finalized result payload.
-
-## State transitions
-
-```text
+~~~text
 planned
-  ├─ real effect cleared       → effect_pending
-  └─ immediate/synthetic       → outcome_ready
+  ├─ real effect admitted → effect_pending
+  └─ immediate/synthetic  → outcome_ready
 
 effect_pending
-  ├─ live effect settles       → outcome_ready
-  ├─ safe orphan replay settles→ outcome_ready
-  └─ unsafe orphan synthesis   → outcome_ready
+  ├─ live effect settles    → outcome_ready
+  ├─ safe orphan replay     → outcome_ready
+  └─ unsafe synthesis       → outcome_ready
 
 outcome_ready
-  └─ source position eligible  → completed
-```
+  └─ source position ready  → completed
+~~~
 
-An implementation may fuse `outcome_ready → completed` into the same transaction that finalizes an immediately placeable head call, but the semantic checks and tests must still cover durable `outcome_ready` for out-of-order calls. Prefer implementing the explicit two-transaction form first.
+立即可放置的 head call 可以把最后一步合并到同一事务，但语义检查必须覆盖持久化 outcome_ready；优先实现显式两事务形式。
 
 ## Fresh execution
 
-### Clearance and intent
+### Clearance 与 intent
 
-Unchanged effect sandwich:
+流程不变：
 
-```text
+~~~text
 planned
-→ prepare arguments, run before_tool, validate replacements
-→ TX[
-     set pi.op.tool_args,
-     set call = effect_pending(replay)
-   ]
+→ prepare args、before_tool、校验替换
+→ TX[set operationToolArgs; set call=effect_pending(replay)]
 → post-commit tool_start
 → admit tool execution
-```
+~~~
 
-The invocation-scoped capability becomes active only for this durable `effect_pending` call.
+invocation capability 只在 durable effect_pending 后激活。
 
 ### Partial output
 
-Every `onUpdate(partialResult, options)` publishes the live update through the existing event/snapshot path. When `options.checkpoint === true`, the harness additionally requests a scalar replacement:
+每个 onUpdate 通过现有 event/snapshot path 发布 live update。checkpoint:true 额外请求：
 
-```text
-TX[
-  setValue(pendingToolOutput(operationId, invocationId), partialResult)
-]
-```
+~~~text
+TX[setValue(pendingToolOutput(operationId, invocationId), partialResult)]
+~~~
 
-The mutation verifies the same operation, turn, source position, and invocation remain `effect_pending`. It does not rewrite `pi.op.state`. A late checkpoint after settlement returns without committing.
+mutation 执行时校验 operation、turn、source position 和 invocation 仍是 effect_pending。它不改 pi.op.state；settlement 后的 late checkpoint 不提交。工具必须写有界完整 snapshot。客户端可显示但只在进程内保留未 durable 的更新。
 
-The tool must checkpoint bounded complete snapshots, not growing unbounded values. Bash uses the same bounded `ShellCaptureProgress` snapshot it already sends live. Clients may render and locally retain live updates newer than the durable checkpoint, but those updates are explicitly process-local.
+### Finalization to outcome_ready
 
-### Finalization to `outcome_ready`
+tool promise settle 后：
 
-When the tool promise settles:
+1. 同步停止接受 update 并让 capability 失效；
+2. 等待 latest tool_update delivery 和 latest checkpoint write；
+3. 如果是真实 fresh/safe replay 且 cancellation 未阻止，执行 after_tool；
+4. 构造完整 ToolResultMessage；
+5. 提交 outcome_ready；
+6. 从 committed staging transition 发出并等待 tool_end。
 
-1. synchronously stop accepting updates and expire the invocation capability;
-2. await the latest tracked `tool_update` delivery and latest checkpoint-write promise; each implies completion of its preceding queue;
-3. run `after_tool` when this is a real fresh or safely replayed result and cancellation did not prevent the hook;
-4. construct the complete final `ToolResultMessage`;
-5. commit the result as `outcome_ready`;
-6. emit and await `tool_end` from the committed staging transition.
+setMemo 返回 promise，tool 必须 await；step.do 始终 await。pre-return enqueue 的 mutation 会排在 staging 前，capability 过期后新调用拒绝。
 
-`setMemo()` returns a promise and tools must await it; `step.do` always does. An unawaited pre-return mutation is still enqueued before staging and is deleted by staging. Calls begun after capability expiry reject. No separate invocation-write drain exists.
-
-Transaction:
-
-```text
-TX[
-  setValue(
-    pendingEntry(resultEntryId),
-    { type: "message", payload: finalizedToolResultMessage },
-  ),
-  deleteValue(pendingToolOutput(operationId, invocationId)),
-  deleteValue(memo.address) for every memo returned before commit by
-    scanValues(operationToolMemoPrefix(operationId, invocationId)),
-  setValue(operationState(operationId), call = outcome_ready(terminate))
-]
-```
-
-The transaction is the linearization point after which the invocation can never replay. Its post-commit `tool_end` is therefore durable evidence that the finalized outcome is ready; it is no longer a pre-commit effect observation.
-
-The staged message contains the final:
-
-- text/image content;
-- provider tool-call ID and tool name;
-- details;
-- `isError`;
-- usage snapshot, when reported;
-- added tool names;
-- timestamp.
-
-`terminate` remains orchestration state because it controls the batch continuation and is copied to the immutable entry's `terminate` field at placement. Staged `addedToolNames` do not affect the active tool set until that result materializes in the transcript.
+事务包含 pendingEntry(finalized message)、删除 pendingToolOutput、删除在 commit 前返回的 invocation memo、设置 call=outcome_ready。它是 invocation 永不 replay 的线性化点；post-commit tool_end 是 outcome ready 的 durable evidence，不再是 pre-commit effect observation。staged message 保存 text/image、provider tool-call ID/name、details、isError、usage、addedToolNames、timestamp；terminate 保留在 orchestration state，并在 placement 时复制到 immutable entry。
 
 ## Source-ordered materialization
 
-After any call becomes `outcome_ready`, find the contiguous ready prefix beginning at the first non-completed source position.
+call 进入 outcome_ready 后，从第一个尚未 completed 的 source position 开始找连续 ready prefix：
 
-Example:
-
-```text
+~~~text
 [completed, outcome_ready, outcome_ready, effect_pending]
              └──────── ready prefix ────────┘
-```
+~~~
 
-Before the placement transaction, emit and await each finalized result's `message_start` and `message_end` in source order. Materialize the prefix in one transaction when practical, then emit `entry_added` and reported usage events in the same source order:
-
-```text
-TX[
-  insert result entry i from pendingEntry(i),
-  deleteValue(pendingEntry(i)),
-  insert tool usage row i if reported,
-
-  insert result entry i+1 with parent = result i,
-  deleteValue(pendingEntry(i+1)),
-  insert tool usage row i+1 if reported,
-
-  setValue(branchTip(lane), newest result),
-  setValue(operationState(operationId),
-           calls i..i+1 = completed and, when complete, next checkpoint)
-]
-```
-
-Each inserted entry uses its already-reserved `resultEntryId`. Writes construct the parent chain in source order inside the transaction.
-
-Tool-reported usage remains durable in the staged message until placement. The initial implementation writes its ledger row atomically with entry materialization, matching the current entry/usage ordering and avoiding a ledger row that references an entry not yet present. No usage ID reservation is needed because a failed placement transaction writes neither row nor completed state.
-
-When the final call materializes, the same transaction calls `scanValues(operationToolArgsPrefix(operationId, turnId))` and deletes every returned address, and transitions to the correct checkpoint:
-
-- every result terminates → `may_finish`, no final assistant required;
-- otherwise → `need_assistant(false)`.
+placement transaction 前按 source order 发送并等待每个 finalized result 的 message_start/message_end；随后在一个事务中插入 result entry、删除 pendingEntry、写 tool usage、更新 Branch tip 和 operation state。entry 使用预留 resultEntryId，并在事务内建立 parent chain。usage 与 entry 同时写，避免 ledger row 指向尚未存在的 entry。最后一个 call materialize 时清理 tool args 并进入 may_finish 或 need_assistant(false)。
 
 ## Parallel execution
 
-Outcome staging follows actual completion order. Entry materialization follows source order.
+outcome staging 按完成顺序，entry materialization 按 source order：
 
-```text
-A, B, C start
-B finishes → B outcome_ready
-C finishes → C outcome_ready
-A finishes → A outcome_ready
-             materialize A, B, C
-```
+~~~text
+A、B、C start
+B finish → B outcome_ready
+C finish → C outcome_ready
+A finish → A outcome_ready
+            materialize A、B、C
+~~~
 
-Crash after B and C stage:
-
-```text
-A effect_pending
-B outcome_ready
-C outcome_ready
-```
-
-Recovery applies unknown-outcome policy only to A. B and C require no tool registration or hook execution to become entries.
-
-The durable invariant changes from “completed calls form a source-ordered prefix” to:
-
-- completed calls form a source-ordered prefix;
-- after that prefix, parallel calls may be `planned`, `effect_pending`, or `outcome_ready` in any mixture;
-- only source-ordered materialization extends the completed prefix.
-
-Sequential execution constructs at most one non-planned call after the completed prefix. Committed call state is trusted on restore; the owning procedure enforces this shape while creating and consuming transitions rather than through a broad restore audit.
+B/C staging 后崩溃时，恢复只对 A 应用 unknown-outcome policy；B/C 不需 tool registry/hook 即可成为 entry。durable invariant 是 completed 形成 source-order prefix，prefix 后可任意混合 planned/effect_pending/outcome_ready，只有 source-order materialization 能扩展 completed prefix。sequential mode 在 prefix 后最多构造一个非-planned call。
 
 ## Unsafe recovery with partial output
 
-For orphaned `effect_pending` with `replay: "never"`:
+对 replay:never 的 orphaned effect_pending：
 
-1. read `pendingToolOutput(operationId, invocationId)` when present;
-2. preserve its bounded content and serializable details;
-3. append a mandatory human-readable interruption marker;
-4. construct a harness-owned `ToolResultMessage` with `isError: true`;
-5. commit it as `outcome_ready` and clean invocation state.
+1. 读取存在的 pendingToolOutput；
+2. 保留 bounded content/details；
+3. 追加必需的人类可读 interruption marker；
+4. 构造 isError:true 的 harness-owned ToolResultMessage；
+5. 以 outcome_ready 提交并清理 invocation state。
 
-The marker must state that output is partial and the external outcome is unknown. `isError: true` describes the result delivered to the model; it does not assert that the external effect failed.
+marker 必须说明输出可能不完整且外部结果未知；isError 描述交给 model 的结果，不断言外部 effect 失败。例如：
 
-Example final text suffix:
-
-```text
+~~~text
 [Tool execution was interrupted. The preceding output is the latest durable progress snapshot; newer live output may be missing, and the external outcome is unknown.]
-```
+~~~
 
-Rules:
-
-- do not run `after_tool` for this synthetic result;
-- preserve checkpoint `usage` when present, but ignore checkpoint `addedToolNames` and `terminate` because progress never has final-result authority;
-- set `terminate: false` and add no tools;
-- an absent checkpoint value is also valid and yields only the interruption result;
-- never infer completion from an apparent success line in partial output;
-- cleanup of partial output and invocation memos is atomic with staging the synthetic result.
+不执行 after_tool；保留 checkpoint usage，但忽略 addedToolNames/terminate；terminate=false，不新增工具；无 checkpoint 也合法；不能从 partial output 的成功行推断完成；cleanup 与 synthetic staging 原子进行。
 
 ## Safe recovery
 
-For orphaned `effect_pending` where both the stored and current declarations are `replay: "safe"`:
+如果 stored/current declaration 都是 replay:safe：
 
-1. retain invocation memos;
-2. atomically delete `pendingToolOutput(operationId, invocationId)`;
-3. emit/reset process-local progress observation as needed;
-4. rerun the tool with persisted arguments and the same `invocationId`;
-5. completed `step.do` calls return their memoized values;
-6. new partial output reconstructs a clean progress stream;
-7. finalization follows the ordinary `outcome_ready` path.
+1. 保留 invocation memo；
+2. 原子删除旧 pendingToolOutput；
+3. 必要时发布/reset 进程内 progress；
+4. 用持久化参数和同一 invocationId 重跑 tool；
+5. 已完成 step.do 直接返回 memo；
+6. 新 partial output 形成干净进度流；
+7. 进入普通 outcome_ready path。
 
-Deleting old progress prevents duplicate chunks when replayed code emits progress again. A crash after the delete but before replay admission remains `effect_pending`; the next recovery repeats the same safe procedure.
+删除旧 progress 可避免 replay 再次发送重复 chunks。若删除后、replay admission 前崩溃，仍为 effect_pending，下一次重复 safe procedure。当前实现缺失或已不再 safe 时使用 unsafe interruption。
 
-If the current tool declaration is missing or no longer safe, use unsafe interruption recovery rather than suspending.
+## Invocation memo 与 step.do
 
-## Invocation memos
+harness-native invocation capability 提供 invocationId、operationId、turnId 以及 getMemo/setMemo。每次操作校验 memo name 和 capability expiry，在 mutation line 上同步 enqueue，并在执行时校验 operation/turn/source/invocation 仍是同一 effect_pending call，只访问本 invocation 地址。过期或 ownership loss 后拒绝。
 
-The harness-native tool call receives a purpose-built invocation capability conceptually equivalent to:
+tool 返回前启动的 memo mutation 按 FIFO 排在 staging 前；之后的 zombie callback 不能重建 memo，也不能写入新 operation。memo 在 effect_pending 期间存活，任何 real/synthetic outcome_ready 时删除。terminal cleanup 仍防御性扫描 operation-owned memo/output family。
 
-```ts
-interface AgentHarnessToolInvocation {
-  readonly invocationId: string;
-  readonly operationId: string;
-  readonly turnId: string;
+step.do 使用 deterministic unique name：
 
-  getMemo(key: string): Promise<JsonValue | undefined>;
-  setMemo(key: string, value: JsonValue | undefined): Promise<void>;
-}
-```
-
-Each operation:
-
-1. validates the memo name and checks process-local capability expiry;
-2. synchronously enqueues work on the Session mutation line before returning its promise;
-3. verifies the operation, turn, source position, and invocation are still the same `effect_pending` call when that job executes;
-4. constructs and reads or writes only `operationToolMemo(operationId, invocationId, name)`;
-5. rejects after capability expiry or durable ownership loss.
-
-The durable check matters for authorized external finalization. In ordinary execution, a memo mutation initiated before the tool returns is FIFO-ordered before outcome staging; one initiated afterward fails the expired-capability check.
-
-A late zombie callback can neither recreate memos after `outcome_ready` nor write into a later operation.
-
-Memos are immediate durable replay state, not application-visible settlement state. They survive close/crash while the call remains `effect_pending` and are deleted when any real or synthetic outcome becomes ready.
-
-Terminal cleanup defensively scans and deletes the operation-owned families:
-
-```ts
-scanValues(operationToolMemoPrefix(operationId))
-scanValues(pendingToolOutputPrefix(operationId))
-```
-
-in addition to other operation-owned addresses. Each returned `StoredValue` supplies its exact bound address for `deleteValue`; no later operation receives a raw key.
-
-## Flue-style `step.do`
-
-Build `step.do` over invocation memos; it does not need its own harness state union:
-
-```ts
-interface ToolSteps {
-  do<T extends JsonValue>(
-    name: string,
-    effect: () => T | Promise<T>,
-  ): Promise<T>;
-}
-```
-
-Algorithm:
-
-```text
-validate deterministic unique name
-→ getMemo("step/" + name)
-→ present: return stored value
-→ absent: run effect
-→ setMemo("step/" + name, value)
+~~~text
+validate name
+→ getMemo
+→ 有值则返回
+→ 无值则执行 effect
+→ setMemo
 → await durability
-→ return value
-```
+→ 返回值
+~~~
 
-Crash behavior:
-
-```text
-before/during effect                    → effect may run on replay
-effect returned, memo not committed     → effect may run on replay
-memo committed                          → replay returns memo
-step A memoized, step B interrupted      → rerun tool; A skips, B runs
-```
-
-This is exactly-once recorded and at-least-once executed. It does not make arbitrary external effects exactly once. An application may derive a stable external idempotency key from `(invocationId, stepName)` when the external API supports one.
-
-Errors are not memoized. A thrown effect either contributes to the current tool result or runs again after safe whole-tool recovery.
-
-Do not add per-step `replay: "never"` in this slice. Supporting it correctly requires a nested `planned → effect_pending → completed` state and an explicit unknown-outcome policy. Whole-tool replay policy is sufficient for the Flue use case already discussed.
-
-Within one live execution, calling the same step name twice is an invariant error. Names must be deterministic across safe replay.
+它是 exactly-once recorded、at-least-once executed，不使任意外部 effect exactly-once。错误不 memoize；同一 live execution 重复 step name 是 invariant error；本阶段不增加 per-step replay policy。
 
 ## Application persistent state
 
-Flue-style application state is distinct from invocation memos.
+应用状态不同于 invocation memo。memo 在 step completed 后立即可见；应用状态必须与最终结果一起在 outcome_ready 时可见，effect 中途崩溃不能提前出现。不要在 execution 中直接 Session.setValue。
 
-Invocation memo:
-
-```text
-step completed → memo becomes visible immediately
-```
-
-Application state:
-
-```text
-tool stages state change
-→ crash before outcome_ready: state must not appear committed
-→ outcome_ready: state and finalized result become visible together
-```
-
-Do not implement application state by calling `Session.setValue()` directly during execution.
-
-Two valid implementation stages:
-
-1. Flue keeps its state externally and atomically stores application state plus a full result memo keyed by `invocationId`.
-2. A later harness API accepts staged application value writes and promotes them in the `outcome_ready` transaction.
-
-The second option is required only if Flue's `usePersistentState` moves into harness-owned session values. Its public typing and conflict semantics remain an open design item for the harness-native tool discussion.
+可行阶段：Flue 在外部维护并按 invocationId 原子保存 state + result memo；或未来 harness 接受 staged application write，在 outcome_ready transaction 提升。第二种只有 usePersistentState 进入 harness-owned values 时才需要，typing/conflict semantics 仍待决定。
 
 ## Cancellation
 
-Cancellation reconciliation never replays a restored tool.
+reconciliation 永不重放 restored tool：
 
-- `planned` calls receive a synthetic aborted result and become `outcome_ready`;
-- a live started call may finalize its real local result under cancelled control, then become `outcome_ready` with `terminate: false`;
-- restored `effect_pending` calls use an interrupted synthetic result, optionally including partial output, regardless of safe replay declaration;
-- existing `outcome_ready` calls are preserved and materialized in source order;
-- invocation memos and partial output are deleted with each staged cancellation outcome;
-- no `before_tool` or `after_tool` starts during restored synthetic reconciliation.
+- planned → synthetic aborted result → outcome_ready；
+- live started call 可以在 cancelled control 下提交真实 local result，但 terminate=false；
+- restored effect_pending 总是 interruption synthetic，可带 partial；
+- 已 outcome_ready 的 call 保留并按 source order materialize；
+- 每个 cancellation outcome staging 都删除 memo/partial；
+- restored synthetic reconciliation 不启动 before_tool/after_tool。
 
-The aborted terminal transaction runs only after every call outcome has materialized and accepted deferred writes have drained under the existing cancellation rules.
+所有 call outcome materialize 且 deferred writes drain 后，才执行 aborted terminal transaction。
 
-## Close and external finalization
+## Close 与 external finalization
 
-Close is still a controlled crash:
+close 是 controlled crash：已在 admission barrier 下 enqueue 的 memo/checkpoint 可完成；最新 checkpoint 之后的 live output 可能丢失；不写 synthetic outcome 或 cancellation marker；状态停留 effect_pending 或 outcome_ready。
 
-- memo/checkpoint mutations already enqueued under the admission barrier may finish;
-- live output newer than the latest committed tool-requested checkpoint may be lost;
-- no synthetic outcome or cancellation marker is written;
-- durable state remains at `effect_pending` or `outcome_ready`.
+External finalization 在 terminal transaction 删除 operation-owned args、memo、partial output、staged outcome 和 pending entry。之后的 live task 因 ownership fence 失败，并通过 OperationEnded 停止。
 
-External finalization deletes operation-owned arguments, invocation memos, partial output, staged pending outcomes, and other pending entries in its terminal transaction. A live task that later tries to stage an outcome fails the ownership fence and stops through `OperationEnded`.
+## Restore 与消费时读取
 
-## Restore and consumption-time reads
+Base restore 只从 owner values 构造 trusted lane/operation projection，不 hydration 或语义审计 args、memo、checkpoint、staged outcome、completed entry、prefix shape 或 execution-mode relation。
 
-Base restore constructs the trusted lane/operation projection from required owner values. It does not hydrate or semantically audit tool arguments, invocation memos, progress checkpoints, staged outcomes, completed entries, completed-prefix shape, or captured execution-mode relationships.
+- planned：不需辅助读取，准备参数并在 effect admission 前写入；
+- effect_pending：读取精确 operationToolArgs，可选 pendingToolOutput；缺失 required args 在消费时 fault，memo 只通过 capability 读取；
+- outcome_ready：读取 pendingEntry；缺失或 message relation 错误在 materialization 时 fault；
+- completed：普通 dispatch 不做 restore audit。
 
-The procedure responsible for the current typed state performs only its exact consumption-time reads:
+所有 live mutation 仍在线上校验 operation、turn、source、invocation、status；这是并发 fence，不是历史恢复验证。
 
-### `planned`
+## Snapshot 与 reconnect
 
-Clearance needs no auxiliary restore read. It prepares the call and writes arguments before effect admission.
+重连客户端可能先看到比 durable checkpoint 更新的进程内 progress；进程替换后只看到最新 committed checkpoint；outcome_ready 在 placement 前以 settled row 出现在 runningTools；completed 在 transcript。
 
-### `effect_pending`
+SnapshotTool 使用 discriminated union：effect_pending 为 running + 可选 result；outcome_ready 为 settled + 必需完整 result + isError；entry_added 后才删除 settled row。planned/completed 不进入 runningTools。
 
-Activation reads `operationToolArgs(operationId, turnId, sourceIndex)` and optionally reads `pendingToolOutput(operationId, invocationId)`. Missing required arguments are an invariant defect at consumption. Invocation memos are read only through the scoped capability. Safe replay, unsafe interruption, and snapshots use no broad prefix scan.
+## Events 与 hooks
 
-### `outcome_ready`
+tool_start 表示 fresh call 的公开 processing presentation，来自 intent commit 或 synthetic staging commit，本身不证明外部 effect 已开始；携带 effective/source args。progress event/checkpoint 不证明完成。harness 等待 latest tool_update delivery 后再 after_tool。
 
-Materialization reads `pendingEntry(resultEntryId)`. Its absence or wrong trusted message relationship is an invariant defect when materialization consumes it. No tool identity or effect recovery is needed.
+tool_end 携带完整最终结果，在 outcome_ready staging commit 后按 completion order 发出，不重复 args。fresh blocked/invalid/truncated/planned-cancel synthetic 在 staging 后按 tool_start→tool_end；unsafe recovery 可以只发 recovery tool_end。message lifecycle 和 entry_added 在 materialize 时发生，entry_added 只移除对应 settled row。listener 不能 reentrant 修改 invocation。
 
-### `completed`
+## Race
 
-Ordinary dispatch performs no restore-time entry audit. Context/tree reads later consume the immutable entry through their normal typed paths.
-
-Every live mutation still verifies current operation, turn, source position, invocation, and status on the Session line. Those checks fence concurrent settlement, cancellation, and external finalization; they are not historical restore validation. Terminal prefix cleanup remains defensive and does not make orphan scans part of restore.
-
-## Snapshots and reconnect
-
-A reconnecting client may see:
-
-- live process-local progress newer than the latest durable checkpoint before disconnect;
-- after process replacement, only the latest committed bounded checkpoint;
-- `outcome_ready` calls as settled rows in `runningTools` until source-ordered materialization;
-- completed calls in the transcript.
-
-`LaneSnapshot.operation.runningTools` is a discriminated union. An effect-pending tool has `status: "running"` and an optional `result` containing the latest complete progress snapshot, falling back to the durable checkpoint after reopen. An outcome-ready call has `status: "settled"`, its required complete final `result`, and `isError`; it remains there until its immutable result entry's `entry_added` removes the row and places the same presentation in the transcript. Planned and completed calls are omitted.
-
-## Events and hooks
-
-- `tool_start` begins public processing presentation for a fresh call; it is emitted from the commit that establishes effect intent or a synthetic staged outcome and does not by itself prove an external effect started. It carries effective arguments for an intended effect and source arguments for an immediate synthetic result.
-- live progress events and durable progress checkpoints do not prove completion.
-- The harness awaits the latest `tool_update` delivery before `after_tool`, preserving the existing listener ordering without making `onUpdate` async.
-- `tool_end` carries the complete finalized result after its `outcome_ready` staging commit, in completion order. It is durable settlement evidence and does not repeat the arguments from `tool_start`.
-- for a fresh blocked, invalid, truncated, or planned-cancellation synthetic outcome, the staging commit emits `tool_start` followed by `tool_end`; these paths still run no tool effect or post-effect hook. Cancellation after effect intent uses the earlier intent-bound start and a staging-bound end.
-- an unsafe restored effect is already represented as running by the initial snapshot and may emit only a recovery-tagged `tool_end` when interruption synthesis stages.
-- message lifecycle and `entry_added` occur when the staged result materializes, not when it first becomes `outcome_ready`; `entry_added` removes only that settled row.
-- passive listeners cannot mutate invocation state reentrantly.
-
-Instrumented-storage tests assert `intent commit → tool_start → tool_update* → outcome staging → tool_end → source-ordered placement` for execution and `outcome staging → tool_start → tool_end → source-ordered placement` for fresh synthetic results. Historical events are not replayed; a safely replayed execution emits recovery `tool_start` from its checkpoint-clear commit and `tool_end` from outcome staging.
-
-## Races
-
-| Race | Required result |
+| race | 必须结果 |
 |---|---|
-| checkpoint vs tool settlement | every accepted checkpoint was enqueued first; settlement awaits the latest promise, then staging deletes the checkpoint value; a late update is ignored |
-| memo write vs `outcome_ready` | an awaited or pre-return-enqueued write precedes staging and is then deleted; a post-return call rejects; external finalization first causes the durable ownership check to reject |
-| B outcome vs earlier A settlement | B stages independently; placement waits for A |
-| crash after outcome staging | tool never replays; pending result later materializes |
-| crash during source-prefix placement | transaction exposes either none or all of that placement prefix |
-| safe replay vs old partial output | the old bound checkpoint value is deleted before replay emits new progress |
-| cancellation vs real settlement | Session mutation order chooses real cancelled-control result or synthetic reconciliation; at most one outcome stages |
-| terminal finalization vs late result | terminal ownership wins or outcome stages first; late task never recreates operation data |
-| external finalization vs memo/checkpoint mutation | mutation first is removed by terminal cleanup; finalization first makes the mutation's durable ownership check reject |
+| checkpoint vs settlement | 已接受 checkpoint 先入队，settlement 等 latest，再 staging 删除；late update 忽略 |
+| memo vs outcome_ready | pre-return write 排在 staging 前并被删除，post-return reject；external finalization 先发生则 durable ownership check reject |
+| B vs earlier A | B 独立 staging，placement 等 A |
+| staging 后崩溃 | tool 不重放，pending result 后续 materialize |
+| source-prefix placement 中崩溃 | 事务暴露 none 或 all |
+| safe replay vs old partial | replay 发 progress 前先删除旧 checkpoint |
+| cancellation vs real settlement | mutation order 只让 real cancelled result 或 synthetic outcome stage 一次 |
+| terminal finalization vs late result | terminal ownership 或先 staging，late task 不重建 operation data |
+| external finalization vs memo/checkpoint | mutation 先发生则被 cleanup，finalization 先发生则 mutation reject |
 
 ## Invariants
 
-1. `invocationId` equals the reserved result entry ID and is stable across safe replay.
-2. A call in `outcome_ready` or `completed` never executes again.
-3. Every `outcome_ready` call has exactly one complete matching `pi.pending.entry` value.
-4. Completed calls form a source-ordered prefix.
-5. Only source-ordered materialization extends that prefix.
-6. Parallel calls after the completed prefix may mix planned, effect-pending, and outcome-ready states.
-7. Invocation memos exist only while their call is `effect_pending`.
-8. Partial output is auxiliary and never establishes effect completion.
-9. Unsafe synthetic results explicitly state that captured output is incomplete and the external outcome is unknown.
-10. Staging an outcome atomically deletes its invocation memos and partial output.
-11. Materialization atomically inserts the immutable entry and deletes its staged pending value.
-12. A late invocation capability cannot write after outcome settlement or operation loss.
-13. `step.do` values are memoized only after their memo write commits; effects remain at-least-once.
-14. Operation terminal cleanup leaves no tool args, invocation memos, partial output, or staged outcomes.
+1. invocationId 等于预留 result entry ID，safe replay 中稳定；
+2. outcome_ready/completed 永不再次执行；
+3. 每个 outcome_ready 恰有一个匹配 pendingEntry；
+4. completed 是 source-order prefix；
+5. 只有 source-order materialization 扩展 prefix；
+6. prefix 后 parallel call 可混合 planned/effect_pending/outcome_ready；
+7. memo 只在 effect_pending 存在；
+8. partial output 只是辅助信息；
+9. unsafe synthetic 明确说明 output incomplete、external outcome unknown；
+10. outcome staging 原子删除 memo/partial；
+11. materialization 原子插入 immutable entry 并删除 pending；
+12. late capability 不能在 settlement/operation loss 后写；
+13. step.do 只在 memo commit 后 memoize，effect 仍至少一次执行；
+14. terminal cleanup 不留下 tool args、memo、partial 或 staged outcome。
 
-## Required tests
+## 必需测试
 
-### State and restore
+覆盖 state/restore、parallel ordering、replay/interruption、memo/step.do、partial output、atomicity/instrumentation：
 
-- every trusted planned/effect-pending/outcome-ready/completed projection restores without auxiliary reads;
-- base restore does not audit completed-prefix or execution-mode relationships;
-- effect-pending consumption reads exact required arguments and optional bounded checkpoint;
-- outcome-ready consumption reads the exact staged result;
-- missing required arguments or staged result fails at the consuming procedure, not base restore;
-- invocation memos and partial output are absent after staging;
-- snapshot/activation hydrate only the exact bounded checkpoint value when needed.
+- 各类 ToolCall projection 在没有不必要 auxiliary read 时可恢复；
+- effect_pending 只读精确 args/可选 bounded checkpoint，outcome_ready 只读精确 staged result；
+- 缺失 required args/result 在消费 procedure fault；
+- B/C 先 staging、crash/reopen 不 replay；
+- safe replay 使用持久化 args 和同一 invocationId，清旧 progress；
+- safe→never downgrade 使用 interruption；
+- unsafe recovery 有/无 checkpoint，synthetic 为 error/incomplete/unknown 且不运行 after_tool；
+- memo get/set/delete、crash 前后 memo、step skip/retry、duplicate name、expiry race；
+- live-only update、checkpoint cadence、bash 100 ms/2 s、latest promise 推导、checkpoint 后不可重建；
+- Memory/JSONL/SQLite checkpoint 一致；
+- 精确 intent→start→update→staging→end→placement 顺序，synthetic staging→start→end→placement；
+- staging 与 cleanup、placement 与 pending/usage/tip/state 原子；
+- 每个边界 crash、无 intent 不启动 effect、outcome_ready 不启动 effect/hook、terminal 删除所有 tool value。
 
-### Parallel ordering
+## 实现地图
 
-- B and C stage while A remains pending;
-- crash/reopen proves B and C never replay;
-- A recovery followed by one source-ordered A/B/C placement transaction;
-- mixed `[completed, outcome_ready, planned, effect_pending, outcome_ready]` state;
-- immediate synthetic outcomes stage out of order;
-- all-terminating batch transitions correctly after ordered placement.
+主要涉及 operation-state types、trusted restore projection、tool batch procedure、source-order materialization、terminal cleanup、cancellation reconciliation、harness update options/snapshot/events、Session mutation line 上的 invocation capability、backend conformance 和 instrumented-storage assertions。
 
-### Replay and interruption
+内置地址：
 
-- safe replay uses persisted arguments and the same invocation ID;
-- safe replay preserves step memos but clears old partial output;
-- current declaration downgrade from safe to never interrupts;
-- unsafe recovery with no checkpoint and with a complete bounded checkpoint;
-- synthetic result is error/incomplete/unknown and never runs `after_tool`;
-- cancellation never safely replays a restored call.
+~~~text
+operationToolMemo(operationId, invocationId, name) → pi.op.tool_memo
+pendingToolOutput(operationId, invocationId)      → pi.pending.tool_output
+pendingEntry(resultEntryId)                       → pi.pending.entry
+~~~
 
-### Invocation memos and `step.do`
-
-- set/get/delete memo with invocation-address scoping;
-- completed step skips effect after reopen;
-- crash before memo commit reruns effect;
-- crash after memo commit returns memo;
-- several completed steps followed by one interrupted step;
-- duplicate live step names reject;
-- memo write racing outcome staging;
-- capability write after expiry, cancellation outcome staging, and external finalization rejects;
-- terminal cleanup removes crash-leaked memos.
-
-### Partial output
-
-- ordinary updates stay live-only;
-- `checkpoint: true` writes the complete bounded snapshot;
-- tool-selected checkpoint cadence and duplicate suppression;
-- bash emits live snapshots at 100 ms and requests distinct checkpoints at most every two seconds;
-- every selected checkpoint enqueues one write, and awaiting the latest promise at tool settlement implies all earlier writes completed;
-- a checkpoint after outcome staging cannot recreate the address's value;
-- Memory, JSONL, and SQLite restore the same checkpoint value;
-- JSONL growth follows checkpoint cadence rather than raw bash output volume;
-- terminal compaction reclaims superseded/deleted checkpoint snapshots according to the existing dead-byte policy.
-
-### Atomicity and instrumentation
-
-- exact intent, synchronous update acceptance, asynchronous update-delivery, `after_tool`, outcome-ready staging, post-commit `tool_end`, source-ordered message lifecycle, and materialization order;
-- outcome staging is atomic with memo/output cleanup;
-- materialization is atomic with pending deletion, usage, tip, and state;
-- crash at every boundary;
-- no effect starts before intent;
-- no effect or hook starts from `outcome_ready`;
-- terminal transaction removes every operation-owned tool value.
-
-## Implementation map
-
-Expected runtime areas:
-
-- operation-state types in `packages/agent/src/harness/session/types.ts`;
-- trusted restore projection and exact consumption-time address reads;
-- tool-batch procedure and source-ordered materialization;
-- terminal cleanup and cancellation reconciliation;
-- harness-specific update options, snapshots, and events;
-- invocation-scoped capability implementation on the Session mutation line;
-- backend conformance through the bound value/list APIs;
-- instrumented-storage transaction assertions.
-
-Concrete built-in address constructors in `session/values.ts`:
-
-```text
-operationToolMemo(operationId, invocationId, name) → value("pi.op.tool_memo", ...)
-pendingToolOutput(operationId, invocationId)      → value("pi.pending.tool_output", ...)
-pendingEntry(resultEntryId)                       → value("pi.pending.entry", ...)
-```
-
-Implement `outcome_ready` and invocation memos before progress checkpoints. The state solves incorrect parallel replay by itself; checkpoints improve reconnect observation and unsafe interruption diagnostics without becoming completion authority.
+先实现 outcome_ready 和 invocation memo，再实现 progress checkpoint。前者单独解决 parallel replay 错误，后者改善 reconnect/unsafe interruption 诊断，但不成为 completion authority。

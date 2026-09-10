@@ -1,81 +1,62 @@
-# pi — design handoff
+# pi — 设计交接文档
 
-Work in numbered order. Each unit is self-contained and independently testable;
-later units consume earlier ones.
+按编号顺序执行。每个单元都自包含且可独立测试；后续单元会使用前置单元的结果。
 
 ```
 01-harness/
-  01-delta/            op vocabulary, tracker, applier, codec   [LANDED IN CHORD]
-  02-scopes/           storage scopes and list tags              [STEP 1 ACTIONABLE]
-  03-execenv/          bounded Shell output, capture, spill      [PRODUCTION CODE + TESTS]
-  04-tool-output/      the ToolOutput sink                       [SPEC ONLY]
-  05-assistant-output/ assistant partials, symmetric with 04     [SPEC ONLY]
+  01-delta/            操作词汇、跟踪器、应用器、编解码器   [已并入 CHORD]
+  02-scopes/           存储作用域和列表标签                 [第 1 步可执行]
+  03-execenv/          有界 Shell 输出、捕获、溢写           [生产代码 + 测试]
+  04-tool-output/      ToolOutput 接收器                     [仅规格]
+  05-assistant-output/ assistant 局部输出，与 04 对称         [仅规格]
 02-plugins/
-  01-facets/           the facet system                          [SPEC ONLY]
-  02-sandbox/          isolated-vm membrane                      [CODE + 412 tests]
+  01-facets/            facet 系统                            [仅规格]
+  02-sandbox/           isolated-vm 膜                        [代码 + 412 个测试]
 ```
 
-Base everything on a clean checkout of `origin/dev`.
+以干净的 `origin/dev` checkout 为基础。
 
-## Read this first
+## 先读这里
 
-**Three units ship working code. Four are specifications.** The table above says
-which. Do not assume a doc describes something that exists.
+**三个单元交付可运行代码，四个单元是规格说明。** 上表已标明具体情况。不要假设文档描述的内容已经存在。
 
-**`01-delta/FINDINGS.md` is historical evidence, not an implementation queue.** Production lives in `packages/chord/src/delta/index.ts`: flush-time dirty tracking fixed D1, and production remeasurement closed D2. The explicit append/truncate API is rejected; see [`01-harness/01-delta/append-decision.md`](01-harness/01-delta/append-decision.md). The code beside the handoff remains prototype and benchmark evidence.
+**`01-delta/FINDINGS.md` 是历史证据，不是实现队列。** 生产代码位于 `packages/chord/src/delta/index.ts`：刷新时的脏跟踪修复了 D1，生产环境重新测量后关闭了 D2。显式追加/截断 API 已被拒绝，见 [`01-harness/01-delta/append-decision.md`](01-harness/01-delta/append-decision.md)。交接目录旁的代码仍是原型和基准测试证据。
 
-**If a doc and the code disagree, the code wins** — fix the doc and say so in the
-commit.
+**如果文档与代码不一致，以代码为准**——修正文档，并在 commit 中说明。
 
-**Port the tests before the implementation.** Each group's comment explains the
-failure it guards against, and several of those failures are silent: wrong output,
-no exception.
+**先移植测试，再实现代码。** 每组测试的注释解释了它防护的失败，而且其中一些失败是静默的：输出错误但不抛异常。
 
-**Benchmark with `node --experimental-strip-types`, never through a transpiler.**
-Measuring this module through `tsx` inflates results 2.6x. `FINDINGS.md` D5 lists
-five more measurement traps, each of which produced a confident wrong conclusion.
+**使用 `node --experimental-strip-types` 做基准测试，绝不要通过转译器。** 通过 `tsx` 测量该模块会使结果膨胀 2.6 倍。`FINDINGS.md` 的 D5 列出了另外五个测量陷阱，每个陷阱都曾导致看似有把握但错误的结论。
 
-## Unit status
+## 单元状态
 
-| unit | ships | state |
+| 单元 | 交付内容 | 状态 |
 | --- | --- | --- |
-| **01-delta** | production implementation and tests in `packages/chord`; prototype evidence here | landed; D1 fixed, explicit text API rejected after production remeasurement |
-| **02-scopes** | spec + [actionable Step 1 handoff](01-harness/02-scopes/implementation-handoff.md) + `scopes.variance.ts` | Step 1 scopes/list tags actionable, not implemented; JSONL Chord encoding/address interning deferred to separately approved Step 2 |
-| **03-execenv** | production implementation in `packages/agent`; prototype evidence here | source-bounded adaptive output, lazy spill backpressure, and bash migration landed; bash's temporary checkpoint cadence moves to `ToolOutput` next |
-| **04-tool-output** | spec + design notes | **not built.** The piece every measurement of the op encoding depends on |
-| **05-assistant-output** | spec | not built. Same shape as 04; do it after |
-| **02-plugins/01-facets** | spec, ~1800 lines | not built. §14 rewritten to match the sandbox PoC |
-| **02-plugins/02-sandbox** | working PoC, 412 assertions | `npm install && npm run audit` |
+| **01-delta** | `packages/chord` 中的生产实现和测试；此处为原型证据 | 已落地；D1 已修复，生产环境重新测量后拒绝显式文本 API |
+| **02-scopes** | 规格 + [可执行的第 1 步交接](01-harness/02-scopes/implementation-handoff.md) + `scopes.variance.ts` | 第 1 步作用域/列表标签可执行但未实现；JSONL Chord 编码/地址驻留延后到另行批准的第 2 步 |
+| **03-execenv** | `packages/agent` 中的生产实现；此处为原型证据 | 基于源的自适应输出、延迟溢写背压和 bash 迁移已落地；bash 的临时检查点节奏下一步移交给 `ToolOutput` |
+| **04-tool-output** | 规格 + 设计说明 | **未构建。** 所有操作编码测量都依赖的部分 |
+| **05-assistant-output** | 规格 | 未构建。形态与 04 相同；之后处理 |
+| **02-plugins/01-facets** | 规格，约 1800 行 | 未构建。§14 已重写以匹配 sandbox PoC |
+| **02-plugins/02-sandbox** | 可运行 PoC，412 个断言 | `npm install && npm run audit` |
 
-## Suggested order
+## 建议顺序
 
-1. **`02-scopes` Step 1** — follow the [actionable implementation handoff](01-harness/02-scopes/implementation-handoff.md); stop for approval before its separate Step 2.
-2. **`04-tool-output`** — reuse the landed adaptive publisher for generic tools, Chord event/durable batches, terminal flushes, and atomic memo checkpoints.
-3. **05**, then **02-plugins**.
+1. **`02-scopes` 第 1 步**——遵循[可执行的实现交接](01-harness/02-scopes/implementation-handoff.md)；在单独的第 2 步开始前停止并等待批准。
+2. **`04-tool-output`**——复用已落地的自适应发布器，处理通用工具、Chord 事件/持久批次、终端刷新和原子 memo 检查点。
+3. **05，然后是 `02-plugins`。**
 
-## Live bugs on `origin/dev`, independent of this design
+## `origin/dev` 上与此设计无关的现存问题
 
-- `drive/tools.ts:257` — `clearReplayCheckpoint` deletes `pendingToolOutput` before
-  re-executing a replay-safe tool. Memos exist so a replayed tool skips work, and
-  skipped work emits nothing, so output for memoised work is lost today. Seed from
-  it instead (`harness-tools.md` §7.4).
-- `runtime/progress.ts:44` — `commitWrite(item)` captures the value at call time
-  and writes fire-and-forget, so an older checkpoint can land after a newer one.
-- memo and checkpoint are two transactions (`drive/tools.ts:112` vs
-  `progress.ts:44`). They must be one (`harness-tools.md` §7.5).
+- `drive/tools.ts:257`——`clearReplayCheckpoint` 会在重新执行可安全重放的工具前删除 `pendingToolOutput`。memo 存在时，重放工具会跳过工作且不产生输出，因此当前 memo 化工作会丢失输出。应从它取种子（`harness-tools.md` §7.4）。
+- `runtime/progress.ts:44`——`commitWrite(item)` 会在调用时捕获值，而写入采用 fire-and-forget，因此旧检查点可能在新检查点之后落盘。
+- memo 和检查点是两个事务（`drive/tools.ts:112` 对比 `progress.ts:44`）。它们必须合并为一个事务（`harness-tools.md` §7.5）。
 
-**Expected test churn:** nine tests assert the old cleanup write set and will fail
-once `retireScope` replaces the per-address deletes. That is the change landing.
+**预期测试变动：** `retireScope` 替代逐地址删除后，九个断言旧清理写集合的测试会失败。这就是正在落地的变更。
 
-## Environment
+## 环境
 
-- Node 22+ for every shipped `.ts` file. They run under
-  `node --experimental-strip-types` with no build step and no dependencies.
-- In the pi repo, tests run from the package:
-  `cd packages/agent && npx vitest run --config vitest.harness.config.ts`.
-  The root vitest config does **not** alias `@earendil-works/pi-ai`; the
-  per-package harness config does.
-- Typecheck with `npx tsgo --noEmit` from the repo root. **Baseline is ~788
-  pre-existing errors**, almost all in `packages/ai/test`. Count only:
-  `grep "error TS" | grep -E "packages/(agent|session-backends)/src"`.
-- `packages/ai` cannot be built offline — model data is fetched at build time.
+- 所有交付的 `.ts` 文件均要求 Node 22+。它们在无需构建步骤和依赖的情况下通过 `node --experimental-strip-types` 运行。
+- 在 pi 仓库中，从包目录运行测试：`cd packages/agent && npx vitest run --config vitest.harness.config.ts`。根 vitest 配置不会为 `@earendil-works/pi-ai` 设置 alias；包级 harness 配置会设置。
+- 从仓库根目录使用 `npx tsgo --noEmit` 做类型检查。**基线约有 788 个既有错误**，几乎全部在 `packages/ai/test`。只统计：`grep "error TS" | grep -E "packages/(agent|session-backends)/src"`。
+- `packages/ai` 无法离线构建——构建时会获取模型数据。

@@ -1,75 +1,70 @@
-# Work package 09 — LaneSnapshot settled-but-unplaced tools
+# WP09 — LaneSnapshot 中已结算但尚未放置的工具
 
-## Status and baseline
+## 状态与基线
 
-- Repository: `earendil-works/pi`
-- Branch at handoff creation: `dev`
-- Baseline commit: `d14d6b22327d545d6a253f932165b63e48d7f9c8`
-- The user reported the worktree clean immediately before this handoff.
-- This document began as an implementation handoff after conversation compaction and now records the implemented design. It is not itself the normative harness specification; `packages/agent/docs/harness.md` remains normative.
+- 仓库：earendil-works/pi
+- handoff 创建时分支：dev
+- 基线提交：d14d6b22327d545d6a253f932165b63e48d7f9c8
+- handoff 创建前用户确认 worktree clean。
+- 本文是实现 handoff，并非规范 harness 说明；规范仍以 packages/agent/docs/harness.md 为准。
+- 本文记录的是已实现的设计。
 
-## Goal
+## 目标
 
-Keep every started or settled-but-unplaced tool call visible in `LaneSnapshot.operation.runningTools` until its immutable `toolResult` entry is placed in the transcript.
+在不可变 toolResult entry 放入 transcript 前，让所有已启动或已结算但尚未放置的工具调用持续出现在 LaneSnapshot.operation.runningTools 中：
 
-The intended projection is:
-
-```text
-planned         → not yet represented in runningTools
+~~~text
+planned         → 不进入 runningTools
 effect_pending  → runningTools(status: "running")
 outcome_ready   → runningTools(status: "settled")
-completed       → transcript toolResult entry
-```
+completed       → transcript 中的 toolResult entry
+~~~
 
-For each call after it becomes presentation-active, `runningTools` and placed transcript entries must not have a gap or overlap. Placement is a source-prefix flush, not an all-tools barrier. Remove a call from `runningTools` on its own `entry_added`, never on `turn_end`.
+调用进入展示阶段后，runningTools 与已放置的 transcript 之间不能有空档或重叠。放置是按 source prefix 刷新，不是等待所有工具。每个调用在自己的 entry_added 时移出 runningTools，不能在 turn_end 时统一清除。
 
-## Original bug
+## 原始问题
 
-A call disappeared between real-effect completion and source-ordered tree placement:
+一次调用在真实 effect 完成到 source-order tree placement 之间消失：
 
-1. `packages/agent/src/harness/runtime/reducer.ts`: `tool_end` spliced the call out of `runningTools`.
-2. `packages/agent/src/harness/runtime/lane.ts`: `captureLaneSnapshot()`, `case "tools"`, projected only `effect_pending` calls and skipped `outcome_ready` calls.
-3. The finalized result was already durable at `pendingEntry(resultEntryId)`, but a fresh/reconnected snapshot could not display it.
-4. It reappeared only after `entry_added` placed the immutable `toolResult` entry.
+1. reducer.ts 的 tool_end 从 runningTools 移除调用；
+2. lane.ts 的 captureLaneSnapshot 在 tools 分支只投影 effect_pending，跳过 outcome_ready；
+3. 结果已经持久化到 pendingEntry(resultEntryId)，但新 snapshot 或重连 snapshot 无法展示；
+4. 直到 entry_added 放入不可变 toolResult entry 后才重新出现。
 
-For a parallel batch `[A, B, C]`, if B settles while A remains pending, B may stay `outcome_ready` until A is ready. If A is already placed, B can place without waiting for C. Therefore clearing everything at `turn_end` is wrong: early-placed results would temporarily exist in both `transcript` and `runningTools`.
+并行批次 [A, B, C] 中，B 可以先结算但要等 A 才能按源顺序放置；如果 A 已放置，B 不必等待 C。因此 turn_end 清空全部工具行会导致早已进入 transcript 的结果短暂同时存在两处。
 
-## Confirmed current architecture
+## 已确认的架构
 
-Mini does **not** replicate structural object deltas.
+Mini 不复制 structural object delta：
 
-- `packages/coding-agent/src/experimental/mini/worker/lane-service.ts` sends one initial full snapshot and then forwards individual `HarnessEvent` objects.
-- `packages/coding-agent/src/experimental/mini/tui/session.ts` folds those events through `reduceLaneSnapshot()`.
-- Reconnect/rebase fetches another complete snapshot.
-- `tool_update` currently carries a complete replacement progress result, not a nested diff.
+- lane-service.ts 发送一次完整初始 snapshot，之后转发 HarnessEvent；
+- mini session.ts 通过 reduceLaneSnapshot() 折叠事件；
+- reconnect/rebase 获取新的完整 snapshot；
+- tool_update 携带完整替换式进度结果，而不是嵌套 diff。
 
-Implemented durable tool flow in `packages/agent/src/harness/runtime/drive/tools.ts`:
+当前持久化工具流程为：
 
-```text
+~~~text
 prepare
 → before_tool
-→ intent commit (effect_pending + effective args), then tool_start
+→ intent commit（effect_pending + effective args），然后 tool_start
 → execute/update/checkpoint
 → after_tool
 → finalize
-→ publishToolOutcome staging commit (pendingEntry + outcome_ready), then tool_end
-→ materializeReady prefix placement
+→ publishToolOutcome staging commit（pendingEntry + outcome_ready），然后 tool_end
+→ materializeReady 按源顺序放置
 → entry_added
-```
+~~~
 
-All real, immediate synthetic, cancellation, and recovery outcomes converge through `publishToolOutcome()`.
+真实调用、立即 synthetic 调用、取消和恢复结果都经过 publishToolOutcome()。Lane.settleOperation() 在 commit-bound event 中先提交并发布进程内状态，再构造 event batch，公开 operation 等待交付。并行执行中，materializeReady 只在 outcome-completion promise resolve 后调度，因此 tool_end 在 staging 之后、placement 之前交付。
 
-`Lane.settleOperation()` supports commit-bound events. It commits, publishes process-local state, constructs the event batch, and the public operation awaits delivery. In parallel execution, `materializeReady()` is scheduled only after the outcome-completion promise resolves. Consequently, `tool_end` is delivered after staging and before placement.
+## 约定的 event 契约变化
 
-## Agreed event contract change
+不增加 tool_result_ready 或 tool_outcome_ready。tool_start/tool_end 改为表示工具调用处理与结果生命周期，而不只是外部真实 effect 生命周期。
 
-Do **not** add `tool_result_ready` or `tool_outcome_ready`.
+### 新执行的真实调用
 
-Instead, redefine harness `tool_start`/`tool_end` as tool-call processing/result lifecycle events rather than exclusively real external-effect lifecycle events.
-
-### Fresh executed call
-
-```text
+~~~text
 intent commit
 → tool_start
 → tool_update*
@@ -78,137 +73,99 @@ intent commit
 → tool_end
 → source-ordered placement
 → entry_added
-```
+~~~
 
-### Fresh synthetic call
+### 新的 synthetic 调用
 
-```text
+~~~text
 TX[pendingEntry + outcome_ready]
 → tool_start
 → tool_end
 → source-ordered placement
 → entry_added
-```
+~~~
 
-The staging transaction's post-commit event batch contains `tool_start` followed by `tool_end`, so a watcher cannot observe either lifecycle event without the authoritative staged state.
+synthetic 包括 unknown tool、参数准备/校验失败、before_tool 拒绝或替换参数无效、assistant length/truncated call，以及 planned 或 effect admission 前的取消。staging transaction 的 post-commit event batch 先发 tool_start 再发 tool_end，因此 watcher 不会看到没有权威 staged state 的生命周期事件。
 
-Fresh synthetic calls include:
+### 恢复
 
-- unknown tool;
-- argument preparation or validation failure;
-- `before_tool` denial or invalid replacement arguments;
-- genuine assistant `length`/truncated call handling;
-- cancellation while still `planned` or after intent but before effect admission.
+历史生命周期事件不重放：
 
-### Recovery
+- 恢复的 effect_pending 已由初始 snapshot 表示；
+- safe replay 在清理 checkpoint 的 commit 发 recovery tool_start，在后续 outcome staging 发 tool_end；
+- unsafe interruption synthesis 可以只发 recovery tool_end，因为初始 snapshot 已有 running 行；
+- 已恢复为 outcome_ready 的调用在初始 snapshot 中就是 settled，无需先重放 end。
 
-Historical lifecycle events are not replayed.
+### tool_end 的含义
 
-- A restored `effect_pending` call is already represented by the initial snapshot.
-- Safe replay emits recovery-tagged `tool_start` from the checkpoint-clear commit and `tool_end` from the later outcome-staging commit.
-- Unsafe interruption synthesis may emit a recovery-tagged `tool_end` without a newly emitted `tool_start`; the initial snapshot supplied the running row.
-- A call already restored as `outcome_ready` appears as settled in the initial snapshot and needs no replayed end event before placement.
+现在 tool_end 表示：
 
-### Meaning of `tool_end`
+> 完整最终工具结果已经持久化 staging，调用已经处于 outcome_ready。
 
-After this change, `tool_end` means:
+它是 reducer 从 running 到 settled 的权威转换，必须在 staging commit 后发出。旧的“真实执行”和“synthetic 结果”区别没有现有运行时消费者需要；不要未经约定增加 execution 字段。
 
-> The complete final tool result is durably staged and the call is `outcome_ready`.
+## LaneSnapshot 类型
 
-It becomes the authoritative reducer transition from running to settled. It must be emitted **after** the staging commit, not before it.
+agent-harness.ts 中的 runningTools 用同一个 result 字段表示进度和最终输出，不再保留 partialResult：
 
-The old distinction between actually executed and synthetic results was encoded by omitting lifecycle events. There is no in-repo runtime consumer requiring that distinction. If preserving it is desired, discuss adding an explicit field such as `execution: "executed" | "synthetic"`; this field was discussed but **not agreed**, so do not add it silently.
-
-## LaneSnapshot type
-
-Change `LaneSnapshot.operation.runningTools` in `packages/agent/src/harness/agent-harness.ts` to use one `result` field for both progress and final output. Do not retain a separate `partialResult` field in the snapshot.
-
-Prefer a discriminated union so invalid combinations are unrepresentable:
-
-```ts
+~~~ts
 type SnapshotTool =
   | {
       status: "running";
       toolCallId: string;
       toolName: string;
       args: unknown;
-      result?: AgentToolResult<unknown>; // latest complete progress snapshot
+      result?: AgentToolResult<unknown>; // 最新完整进度快照
     }
   | {
       status: "settled";
       toolCallId: string;
       toolName: string;
       args: unknown;
-      result: AgentToolResult<unknown>;  // complete finalized result
+      result: AgentToolResult<unknown>;  // 完整最终结果
       isError: boolean;
     };
-```
+~~~
 
-The user explicitly agreed to the discriminated union.
+tool_update.partialResult 仍可在 event API 中使用该名称；reducer 把它写入 snapshot 行的 result。Mini 传输的是语义事件而不是结构 diff，因此 tool_end 即使与最后一次 update 相同，也携带完整最终结果。
 
-`tool_update.partialResult` may remain named `partialResult` in the event API; the reducer assigns it to the snapshot row's unified `result` field.
+## 精确 reducer 行为
 
-The current mini transport sends semantic events, not structural deltas, so `tool_end` still carries the complete final result even if it equals the latest update. Unifying the snapshot field is still the correct state model.
+文件：packages/agent/src/harness/runtime/reducer.ts。
 
-## Exact reducer behavior
+### tool_start
 
-File: `packages/agent/src/harness/runtime/reducer.ts`
+使用 matchingOperation(snapshot, event.runId)，按 toolCallId upsert，设置 running、toolName、args；替换已有行时清理 settled-only 字段，不保留旧最终结果。upsert 是必要的，因为 watch 可能先捕获持久化的 effect_pending，再收到缓冲的 tool_start。
 
-### `tool_start`
+### tool_update
 
-- Resolve the operation with `matchingOperation(snapshot, event.runId)`.
-- Upsert by `toolCallId`; do not blindly push.
-- Set `status: "running"`, `toolName`, `args`.
-- Clear stale settled-only fields if replacing an existing row.
-- Preserve no stale final result. A newly started/replayed call may receive later `tool_update` values.
+使用 matchingOperation，而不是直接使用 snapshot.operation；找到对应行后，只有 running 行才用 event.partialResult 替换 result。错误 operation 或不存在的行忽略。
 
-Upsert is required because a watch may capture durable `effect_pending` state before the buffered `tool_start` event is delivered.
+### tool_end
 
-### `tool_update`
+使用 matchingOperation，按当前 batch 的 toolCallId 找已有行，将其替换为 settled，保留 args，使用 event.result 和 event.isError。不能创建新行。最终结果在放置前继续展示。
 
-- Use `matchingOperation(snapshot, event.runId)`, not `snapshot.operation` directly.
-- Find the matching row.
-- For a running row, replace `result` with `event.partialResult`.
-- Ignore wrong-operation or missing rows.
+### entry_added
 
-### `tool_end`
+如果 event.entry 是 role 为 toolResult 的 message，按 batch-local toolCallId 从 runningTools 移除，再更新 transcript。不要在 turn_end 清理工具行。
 
-- Resolve with `matchingOperation(snapshot, event.runId)`.
-- Find the existing row by batch-local `toolCallId`; only one tool batch is presentation-active at a time.
-- Replace it with `status: "settled"`, preserving its arguments and using `event.result` and `event.isError`.
-- This naturally removes the provisional interpretation of the old `result`; there is no separate `partialResult` to delete.
-- The finalized result remains displayed until placement.
+## 权威 snapshot capture 行为
 
-`tool_end` does not carry arguments and cannot create a row. Fresh synthetic `tool_start` and `tool_end` are emitted together after the staging commit, eliminating the old capture/event gap. Unsafe recovery relies on the initial snapshot's running row.
+文件：packages/agent/src/harness/runtime/lane.ts 的 captureLaneSnapshot()，tools 分支。assistant entry 只加载一次。
 
-### `entry_added`
+### planned
 
-If `event.entry` is a message whose role is `toolResult`, remove the matching batch-local `toolCallId` from `snapshot.operation?.runningTools`, then apply the transcript update. Harness events are serialized, trusted, emitted exactly once, and not historically replayed, so neither duplicate-entry handling nor cross-batch identity is needed.
+跳过，尚未进入展示阶段。
 
-Do not clear tool rows on `turn_end`.
+### completed
 
-## Exact authoritative capture behavior
+跳过，其 toolResult entry 应已在 captured transcript 中。
 
-File: `packages/agent/src/harness/runtime/lane.ts`, `captureLaneSnapshot()`, `case "tools"`.
+### effect_pending
 
-The assistant entry is already loaded once. For each batch call:
+校验 assistant.message.content[sourceIndex] 是匹配的 toolCall；读取必需的 operationToolArgs 和可选的 pendingToolOutput。投影为：
 
-### `planned`
-
-Skip. It has not become presentation-active yet.
-
-### `completed`
-
-Skip. Its `toolResult` entry must already be in the captured transcript.
-
-### `effect_pending`
-
-- Validate that `assistant.message.content[sourceIndex]` is the matching `toolCall` block.
-- Read `operationToolArgs(operationId, turnId, sourceIndex)`; it is required for effect-pending calls.
-- Read optional `pendingToolOutput(operationId, resultEntryId)`.
-- Project:
-
-```ts
+~~~ts
 {
   status: "running",
   toolCallId: block.id,
@@ -216,302 +173,129 @@ Skip. Its `toolResult` entry must already be in the captured transcript.
   args: persistedArgs,
   ...(checkpoint === undefined ? {} : { result: checkpoint })
 }
-```
+~~~
 
-### `outcome_ready`
+### outcome_ready
 
-- Validate the source tool-call block.
-- Read `pendingEntry(call.resultEntryId)`.
-- Require a message payload with role `toolResult`.
-- Validate staged `toolCallId` and `toolName` against the source block.
-- Read `operationToolArgs(...)` when present.
-- Use `persistedArgs ?? block.arguments`. Immediate synthetic calls may never have written `operationToolArgs`, and this absence is legal only for the outcome-ready projection.
-- Reconstruct the canonical `AgentToolResult` from the staged `ToolResultMessage` and the durable call termination flag as needed.
-- Project `status: "settled"`, `result`, and `isError`.
+校验源 tool-call block，读取 pendingEntry(call.resultEntryId)，要求 payload 是 role=toolResult 的 message，并校验 staged toolCallId/toolName。读取存在的 operationToolArgs；若不存在，使用 source block arguments。立即 synthetic 调用没有写 operationToolArgs 是合法的。
 
-The event and capture representations must normalize the final result identically so folding through `tool_end` equals a later authoritative snapshot. Pay attention to optional `details`, `usage`, `addedToolNames`, and `terminate`; do not rely on incidental object-property presence differences.
+从 staged ToolResultMessage 和持久化终止标记重建 canonical AgentToolResult，投影为 settled、result、isError。event 和 capture 必须以完全相同方式规范化 optional details、usage、addedToolNames、terminate。不匹配或缺失的 staged result 是展示数据损坏，snapshot capture 必须 fault。
 
-A missing or mismatched staged result for `outcome_ready` is presentation corruption and must fault snapshot capture.
+## 运行时 event 生产变化
 
-## Runtime event production changes
+主要文件：runtime/drive/tools.ts；相关 helper 在 execution/tools.ts 和 runtime/drive/tool-placement.ts。
 
-Primary file: `packages/agent/src/harness/runtime/drive/tools.ts`
+ToolOutcome 要同时保留 staged ToolResultMessage、tool_end.result、tool_end.isError 以及取消归一化后的 terminate，避免 post-commit 重新构造时丢失信息。synthetic helper 也必须携带 canonical result，但不能凭空给 transcript 增加 details。
 
-Related helpers: `packages/agent/src/harness/execution/tools.ts` and `packages/agent/src/harness/runtime/drive/tool-placement.ts`.
+新执行通过 publishToolIntent() 将 tool_start 绑定到保存 effective args 和 effect_pending 的 commit；公开 operation 等待 event 交付后才允许 executeToolCall()。未写 effect intent 的 synthetic 调用在 outcome staging commit 中按 tool_start、tool_end 顺序发事件。safe recovery 的 checkpoint-clear commit 发 recovery tool_start；已经通过初始 snapshot 恢复的 unsafe effect_pending 不再次发 start。
 
-### Internal outcome shape
+删除 performToolInvocation() 当前 staging 前的 tool_end。publishToolOutcome() 在同一 staging command 的 events callback 中发 tool_end，携带 runId、turnId、toolCallId、toolName、canonical result、isError、归一化 terminate 和必要的 recovery 标记。args 只属于 tool_start。
 
-Current:
+因为 Lane.command() 等待 event delivery，runParallel() 又从 outcome promise 调度 materialization，顺序必须是：
 
-```ts
-type ToolOutcome = { message: ToolResultMessage<unknown>; terminate: boolean };
-```
-
-Extend/refactor it so post-commit event production has the complete canonical final result and `isError`, without lossy reconstruction. It must retain enough data for:
-
-- staged `ToolResultMessage`;
-- `tool_end.result`;
-- `tool_end.isError`;
-- durable/effective `terminate` after cancellation normalization.
-
-Synthetic helpers currently return `ToolResultMessage` directly. Refactor carefully so synthetic outcomes also carry the canonical result data. Do not invent `details` in the transcript: existing unknown/invalid synthetic results deliberately omit message details.
-
-### Commit-bound `tool_start`
-
-For fresh execution, `publishToolIntent()` attaches `tool_start` to the commit that persists effective arguments and changes the call to `effect_pending`. The public operation awaits delivery before admitting `executeToolCall()`, preserving `tool_start → tool_update*` without requiring each update callback to await delivery.
-
-For a fresh synthetic call that never writes effect intent, `publishToolOutcome()` attaches `tool_start` before `tool_end` in the outcome-staging commit's event batch. It reports the source block arguments.
-
-For safe recovery, the checkpoint-clear commit emits recovery-tagged `tool_start` using persisted effective arguments. Do not emit a fresh start for an already-restored unsafe `effect_pending` call; its initial snapshot is the baseline.
-
-### Post-commit `tool_end`
-
-Remove the current pre-staging `tool_end` emission from `performToolInvocation()`.
-
-`publishToolOutcome()` attaches `tool_end` to the same staging command's `events` callback. The event carries:
-
-- `runId`, `turnId`, `toolCallId`, `toolName`;
-- canonical final `result`;
-- `isError`;
-- cancellation-normalized durable `terminate`;
-- `recovery: true` where applicable.
-
-Arguments belong to `tool_start` and are not repeated on `tool_end`. Event data describes the state actually committed, especially cancellation forcing `terminate: false`.
-
-Because `Lane.command()` awaits retained event delivery and `runParallel()` schedules materialization from the outcome-completion promise, the required order is:
-
-```text
+~~~text
 staging commit
 → tool_end delivery
 → source-ready message lifecycle
 → placement commit
 → entry_added
-```
+~~~
 
-### Call sites to audit
+审计所有 publishToolOutcome() 调用：立即结果、intent 后取消、正常完成、safe replay、unsafe recovery、planned 取消、effect_pending 取消，以及 performToolInvocation() 内同步 AbortRequested 路径。
 
-Every `publishToolOutcome()` call must supply the source tool call and recovery context correctly:
-
-- immediate outcome in `startToolInvocation()`;
-- cancellation after intent but before execution;
-- normal `performToolInvocation()` completion;
-- safe replay completion;
-- unsafe recovery interruption;
-- sequential cancellation of `planned`;
-- sequential cancellation of `effect_pending`.
-
-Also audit the synchronous `AbortRequested` path inside `performToolInvocation()`: a call with durable intent must still have coherent start/end presentation even if effect admission fails immediately.
-
-## Mini and other presentation consumers
+## Mini 与其他展示消费者
 
 ### Mini
 
-File: `packages/coding-agent/src/experimental/mini/tui/view.ts`, `MiniTui.apply()`.
+mini/tui/view.ts 的 MiniTui.apply()：
 
-For each `runningTools` row:
-
-```text
-status running:
+~~~text
+running：
   markExecutionStarted()
-  if result exists: updateResult({...result, isError:false}, true)
+  若有 result：updateResult(result + isError:false, true)
 
-status settled:
-  do not call markExecutionStarted()
-  updateResult({...result, isError}, false)
-```
+settled：
+  不调用 markExecutionStarted()
+  updateResult(result + isError, false)
+~~~
 
-The final result remains visible while awaiting placement. After `entry_added`, transcript synchronization supplies the immutable `ToolResultMessage` and the row is no longer in `runningTools`.
+等待 placement 时保留最终结果；entry_added 后 transcript 同步提供不可变 ToolResultMessage，runningTools 行才消失。
 
-### Other shared consumer
+### 其他共享消费者
 
-Apply equivalent handling in:
+对 packages/coding-agent/src/experimental/client-tui-chat.ts 应采用同等处理。编辑前阅读 modes/interactive/components/tool-execution.ts，确认 updateResult(result, isPartial) 语义。
 
-- `packages/coding-agent/src/experimental/client-tui-chat.ts`
+## 测试
 
-Read `packages/coding-agent/src/modes/interactive/components/tool-execution.ts` before editing to confirm `updateResult(result, isPartial)` semantics.
+### Reducer 测试
 
-## Tests
+reducer.test.ts 构造 [0,1,2]：
 
-### Reducer tests
+1. 三个调用都 running；
+2. 2 先结算；
+3. 0 结算并在 1 仍运行时放置；
+4. 1 结算；
+5. placement 按源顺序放置 1、2；
+6. 每次 settlement/placement 后，每个展示中的调用恰好位于 runningTools 或 transcript toolResult 之一；
+7. 2 被 0 阻塞时仍以 settled 和最终 result 保留；
+8. 每个 entry_added 只移除对应行。
 
-File: `packages/agent/test/harness/runtime/reducer.test.ts`
+另测错误 runId 的 tool_update 不改变当前 operation、tool_start 不重复 upsert、tool_end 只结算已有 batch 行。
 
-Add a parallel batch event-fold test with calls 0, 1, 2:
+### Capture/watch 测试
 
-1. Establish all three as running.
-2. Call 2 settles before call 0.
-3. Call 0 settles and is placed while call 1 still runs.
-4. Call 1 settles.
-5. Placement flushes calls 1 and 2 in source order.
-6. After every settlement and placement event, assert each presentation-active call appears in exactly one of:
-   - `operation.runningTools`; or
-   - transcript `toolResult` entries.
-7. Assert call 2 remains present with `status:"settled"` and its final result while blocked by earlier calls.
-8. Assert each `entry_added` removes only its matching active row.
+watch.test.ts 覆盖 planned（省略）、带 checkpoint 的 effect_pending（running/result）、无 checkpoint 的 effect_pending、带 effective args 的真实 outcome_ready、无 operationToolArgs 且回退源参数的 synthetic outcome_ready，以及已在 transcript 中的 completed。验证 staged 内容、isError、args、无重复，并覆盖 pendingEntry 缺失/不匹配 corruption。
 
-Add focused coverage for:
+### 运行时工具测试
 
-- `tool_update` from a stale/wrong `runId` does not mutate the current operation;
-- `tool_start` upserts rather than duplicates a row captured from durable intent;
-- `tool_end` settles the existing batch-local row.
+drive-tools.test.ts 断言真实流程为 intent commit < tool_start < tool_update* < staging commit < tool_end < entry_added；synthetic 为 staging commit < tool_start < tool_end < entry_added，且无 effect、无 after_tool；覆盖 planned cancellation、unsafe recovery、B 先结束但保持 settled、source-order placement、staging 后 crash 不重放。旧规范要求 tool_end 在 staging 前，现已有意反转。
 
-### Capture/watch tests
+### 类型和 event catalog
 
-File: `packages/agent/test/harness/runtime/watch.test.ts`
+审计 types.test.ts 与 telemetry.ts。不增加新 event 名称；tool_end 不带 args，但语义改变。
 
-Construct a durable tools state containing:
+### Mini 回归
 
-- `planned` (omitted);
-- `effect_pending` with checkpoint (`status:"running"`, checkpoint exposed as `result`);
-- `effect_pending` without checkpoint;
-- real `outcome_ready` with persisted effective args;
-- synthetic `outcome_ready` without `operationToolArgs`, falling back to source block arguments;
-- completed call represented only by a transcript entry where practical.
+运行真实 mini abort smoke test：执行 sleep 20，约两秒后发送 Escape，确认 Command aborted、耗时、toolErrorBg 的 ANSI 48;2;60;40;40；确认 durable session 有 isError:true 的 tool result 且 operation 状态为 aborted。另测后完成工具在 in-order placement 前最终结果持续可见。
 
-Assert staged settled content, `isError`, arguments, and absence of duplicates. Add missing/mismatched `pendingEntry` corruption assertions.
+## 文档变化
 
-### Runtime tool tests
+完整阅读并更新 harness.md 与 tool-durability.md 中关于以下旧规则的表述：
 
-File: `packages/agent/test/harness/runtime/drive-tools.test.ts`
+- tool_end 在 staging 前；
+- tool_start/tool_end 仅表示真实 effect；
+- synthetic 不发送生命周期；
+- outcome_ready 不进入 runningTools；
+- snapshot 使用 partialResult 字段。
 
-Update/add ordering assertions proving:
+新文档必须说明 tool_end 是 staging 后的持久化证据，fresh synthetic 有 start/end，恢复事件不历史重放，outcome_ready 直到 placement 仍以 settled 投影，entry_added 把 settled presentation 移入 transcript，统一 result 字段在 running 时为进度、settled 时为最终结果。
 
-- real: `intent commit < tool_start < tool_update* < staging commit < tool_end < entry_added`;
-- immediate synthetic: `staging commit < tool_start < tool_end < entry_added`, no tool effect and no `after_tool`;
-- planned cancellation gets coherent start/end;
-- unsafe recovery uses initial snapshot plus recovery-tagged end without replaying effects;
-- B can emit post-commit end and remain settled while A blocks placement;
-- source-order placement remains unchanged;
-- a crash after staging cannot replay the call.
+不要顺便修改 response.ts 与 tool-placement.ts 的 recovery turn_end 差异。
 
-The baseline normative tests/documentation required `tool_end` before staging; the implementation reverses those expectations deliberately.
+## 完成后需重新完整阅读
 
-### Type/event catalog tests
+核心规范和实现：harness.md、tool-durability.md、agent-harness.ts、reducer.ts、lane.ts、drive/tools.ts、tool-placement.ts、execution/tools.ts、runtime/types.ts、session/types.ts、events.ts、telemetry.ts。
 
-Audit:
+测试：reducer.test.ts、watch.test.ts、drive-tools.test.ts、types.test.ts 及其 helper。
 
-- `packages/agent/test/harness/types.test.ts`
-- `packages/agent/src/harness/telemetry.ts`
+Mini：mini session.ts、lane-service.ts、protocol.ts、view.ts、client-tui-chat.ts、interactive/components/tool-execution.ts。
 
-No new event name is added. `tool_end` omits arguments and its semantics change.
+编辑前检查 git status 和当前 diff，因为多个 Pi session 可能共享 worktree。
 
-### Mini regression
+## 校验命令
 
-After unit tests, run the real mini abort smoke test used previously:
+按仓库根目录规范，完成后运行相关 reducer/watch/drive-tools/types focused Vitest、npm run check；最终运行 ./test.sh。不要运行 npm test、完整 Vitest 或 npm run build，除非用户明确要求。
 
-- execute exactly `sleep 20`;
-- send Escape after about two seconds;
-- assert `Command aborted` and elapsed time appear;
-- assert raw ANSI contains `toolErrorBg` (`48;2;60;40;40`);
-- verify the durable session contains an `isError:true` tool result and operation status `aborted`.
+若进行 delegated review，使用 provider anthropic、model claude-fable-5，并保持 extensions 开启。
 
-Also exercise a parallel batch where a later tool finishes first and verify its final result remains visible until in-order placement.
+## 非目标
 
-## Documentation changes
-
-Read both documents completely before editing:
-
-- `packages/agent/docs/harness.md` (normative)
-- `packages/agent/docs/tool-durability.md`
-
-The implementation updates baseline statements that required:
-
-- `tool_end` before staging;
-- `tool_start`/`tool_end` only for real effects;
-- synthetic outcomes emitting no lifecycle;
-- `outcome_ready` being omitted from `runningTools`;
-- snapshot field `partialResult`.
-
-Important known locations from the baseline:
-
-- `harness.md` §3.8 around lines 784–796;
-- `harness.md` §5.4 `LaneSnapshot` around lines 1101–1134;
-- `harness.md` §5.5 events around lines 1140–1158;
-- `harness.md` tool phases around lines 1214–1224;
-- `harness.md` conformance requirements around lines 1386–1400;
-- `tool-durability.md` finalization around lines 255–280;
-- `tool-durability.md` snapshots/events around lines 568–584;
-- `tool-durability.md` test requirements around lines 671–679.
-
-The revised docs must state:
-
-- `tool_end` is post-staging durability evidence for a final result;
-- fresh synthetic outcomes receive start/end lifecycle;
-- recovery events are not historically replayed;
-- `outcome_ready` remains projected as settled until placement;
-- `entry_added` moves settled presentation into transcript;
-- the unified snapshot `result` is provisional when running and final when settled.
-
-Do not modify the separate `response.ts`/`tool-placement.ts` recovery `turn_end` discrepancy unless separately requested.
-
-## Files to reread completely after compaction
-
-Core/specification:
-
-1. `packages/agent/docs/harness.md`
-2. `packages/agent/docs/tool-durability.md`
-3. `packages/agent/src/harness/agent-harness.ts`
-4. `packages/agent/src/harness/runtime/reducer.ts`
-5. `packages/agent/src/harness/runtime/lane.ts`
-6. `packages/agent/src/harness/runtime/drive/tools.ts`
-7. `packages/agent/src/harness/runtime/drive/tool-placement.ts`
-8. `packages/agent/src/harness/execution/tools.ts`
-9. `packages/agent/src/harness/runtime/types.ts`
-10. `packages/agent/src/harness/session/types.ts`
-11. `packages/agent/src/harness/events.ts`
-12. `packages/agent/src/harness/telemetry.ts`
-
-Tests:
-
-13. `packages/agent/test/harness/runtime/reducer.test.ts`
-14. `packages/agent/test/harness/runtime/watch.test.ts`
-15. `packages/agent/test/harness/runtime/drive-tools.test.ts`
-16. `packages/agent/test/harness/types.test.ts`
-17. Relevant test helpers imported by those files.
-
-Mini/presentation:
-
-18. `packages/coding-agent/src/experimental/mini/tui/session.ts`
-19. `packages/coding-agent/src/experimental/mini/worker/lane-service.ts`
-20. `packages/coding-agent/src/experimental/mini/shared/protocol.ts`
-21. `packages/coding-agent/src/experimental/mini/tui/view.ts`
-22. `packages/coding-agent/src/experimental/client-tui-chat.ts`
-23. `packages/coding-agent/src/modes/interactive/components/tool-execution.ts`
-
-Before editing, run `git status --short` and inspect current diffs because other Pi sessions may share the worktree.
-
-## Validation commands
-
-From repository root, after changes:
-
-```bash
-cd packages/agent
-node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/harness/runtime/reducer.test.ts
-node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/harness/runtime/watch.test.ts
-node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/harness/runtime/drive-tools.test.ts
-node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/harness/types.test.ts
-cd "$(git rev-parse --show-toplevel)"
-npm run check
-```
-
-Do not run `npm test`, the full Vitest suite, or `npm run build` unless requested.
-
-If a delegated review is used, repository policy requires:
-
-```text
---provider anthropic --model claude-fable-5
-```
-
-Keep extensions enabled.
-
-## Non-goals
-
-- No generic structural-delta transport for mini.
-- No optimization to avoid the final result crossing the wire once in `tool_end` and again in `entry_added`.
-- No change to source-prefix placement semantics.
-- No clearing on `turn_end`.
-- No change to tool effect replay/durability rules.
-- No change to `after_tool`: it still runs only for actual fresh/safely replayed effects under its existing cancellation contract.
-- No work on the separate recovery `turn_end` discrepancy between `response.ts` and `tool-placement.ts`.
-- No backward-compatibility layer unless the user explicitly asks for one.
-- Do not commit unless the user asks.
+- 不做 Mini 的通用 structural-delta transport；
+- 不优化避免 tool_end 和 entry_added 各传一次最终结果；
+- 不改变 source-prefix placement；
+- 不在 turn_end 清理；
+- 不改变 tool effect replay/durability 规则；
+- after_tool 仍只对真实 fresh/safe replay effect 执行；
+- 不处理 response.ts 与 tool-placement.ts 的 recovery turn_end 差异；
+- 不增加未经明确要求的兼容层；
+- 不提交，除非用户要求。

@@ -1,30 +1,20 @@
-# Tool Output and Progress
+# 工具输出和进度
 
-> **Scope:** harness-local. Nothing here depends on the facet system, RPC, or any
-> presentation. Depends on [delta tracking](../01-delta/delta.md) (the landed Chord op vocabulary and tracker), [execution environments](../03-execenv/execenv.md) (where truncation happens), and [scoped storage](../02-scopes/scopes.md) (durability).
+> **范围：** Harness 本地。本文不依赖 facet system、RPC 或任何 presentation。依赖 [delta tracking](../01-delta/delta.md)（已落地的 Chord op 词汇和 tracker）、[execution environment](../03-execenv/execenv.md)（截断发生的位置）和[作用域存储](../02-scopes/scopes.md)（持久化）。
 
-## 1. The problem
+## 1. 问题
 
-Three faults, one cause.
+三个故障，一个根因。
 
-**Tools each implement their own truncation.** `bash.ts` owns a rolling buffer,
-`truncateTail`, a spill file, an update throttle and a checkpoint interval.
-`read.ts` has its own truncation. Every future tool producing bulk output
-reimplements this, differently.
+**每个工具都实现自己的截断。** `bash.ts` 拥有 rolling buffer、`truncateTail`、溢写文件、update throttle 和 checkpoint interval。`read.ts` 也有自己的截断。以后每个产生批量输出的工具都会以不同方式重复实现这些功能。
 
-**Progress is a whole value.** `onUpdate(partialResult)` hands over a complete
-`AgentToolResult` on every update, `tool_update` carries that whole result, and
-`openToolProgress` persists it with `setValue`.
+**Progress 是一个完整 value。** `onUpdate(partialResult)` 每次更新都交出完整的 `AgentToolResult`，`tool_update` 携带完整 result，`openToolProgress` 使用 `setValue` 持久化它。
 
-**`details: unknown` was believed to force this** — you cannot append to a value
-whose shape you do not know. That premise is now false. A structural tracker
-(`delta.md`) records ops against JSON without knowing the type, so details need
-no special handling at all.
+**有人认为 `details: unknown` 迫使我们这样做**——不知道 value 的 shape 就无法 append。这个前提已经错误。结构 tracker（`delta.md`）可以在不知道类型的情况下对 JSON 记录 op，因此 details 完全不需要特殊处理。
 
 ## 2. `ToolOutput`
 
-The harness constructs a sink per invocation and passes it to `execute`. **Tools
-return nothing**; the sink holds the result.
+Harness 为每次 invocation 构造一个 sink，并传给 `execute`。**Tool 不返回任何内容**；结果由 sink 持有。
 
 ```ts
 interface ToolOutput<TDetails extends JsonValue> {
@@ -59,27 +49,19 @@ execute(
 ): Promise<void>;
 ```
 
-`execute` returns `void`. Everything the tool produces flows through the sink —
-including `usage` and `addTools`, which cannot be settle-time return values
-because a replayed tool must be able to seed from durable state (§7.4).
+`execute` 返回 `void`。工具产生的所有内容都经过 sink——包括 `usage` 和 `addTools`；它们不能是 settle-time return value，因为 replay 的 tool 必须能从 durable state 取 seed（§7.4）。
 
-**Failure is a thrown error.** `isError` is set by the harness when `execute`
-rejects. A tool may throw anything, including errors from libraries it did not
-write.
+**失败通过抛出 error 表示。** `execute` reject 时由 Harness 设置 `isError`。Tool 可以抛出任何内容，包括它没有编写的 library error。
 
-**`terminate` is orthogonal to how execution ended**, so a failing tool can ask
-the loop to stop:
+**`terminate` 与执行如何结束正交，**因此失败的 tool 可以要求 loop 停止：
 
 ```ts
 try { await thing(); } catch (error) { out.terminate(true); throw error; }
 ```
 
-This closes a gap in the current implementation, where `executeToolCall`'s catch
-hardcodes `isError: true` with no terminate, and `immediateError`'s terminate
-parameter is only ever passed `true` by `applyBeforeToolDecision` for a hook
-block.
+这修复当前实现中的缺口：`executeToolCall` 的 catch 会硬编码 `isError: true` 但不设置 terminate，而 `immediateError` 的 terminate 参数只会由 hook block 的 `applyBeforeToolDecision` 传入 `true`。
 
-### 2.1 Details are just an object
+### 2.1 Details 只是一个对象
 
 ```ts
 async execute(id, params, signal, out, context) {
@@ -90,7 +72,7 @@ async execute(id, params, signal, out, context) {
 }
 ```
 
-Fully granular ops fall out, verified against the prototype:
+经过原型验证，完整粒度的 op 会自然产生：
 
 ```jsonc
 ["#",0,["details","passed"]]
@@ -99,47 +81,29 @@ Fully granular ops fall out, verified against the prototype:
 ["d",["details","current"]]
 ```
 
-No recipes, no mutation map, no `initialDetails` on `tool_start`, no Immer, and
-no consumer ever runs tool code. `TDetails` remains the tool's own exported type
-so a renderer can cast `call.details` to it — that is all it is for.
+没有 recipe、mutation map、`tool_start` 上的 `initialDetails`、Immer，也没有 consumer 执行 tool code。`TDetails` 仍是 tool 自己导出的类型，因此 renderer 可以把 `call.details` cast 成它；这就是它的全部用途。
 
-A survey of `packages/agent/src/harness/tools/` found **no tool mutating details
-incrementally today**; only `bash.ts` writes them mid-stream and it rebuilds them
-whole, because the container was replaced wholesale anyway. This design removes
-that cause, and costs nothing if nobody takes it up.
+对 `packages/agent/src/harness/tools/` 的调查发现，**当前没有任何 tool 增量修改 details**；只有 `bash.ts` 在流中写入 details，而且它会整体重建，因为 container 本来就会整体替换。本设计移除该原因；没人采用增量修改时不会产生额外成本。
 
-**Caveat:** details are now unbounded. A tool pushing to `failures` in a loop
-grows without limit, and unlike text there is no cap. Nothing shipped does this;
-the door is open in a way it was not when details were a replace-only value.
+**注意：** details 现在没有上限。循环向 `failures` push 的 tool 会无限增长；与 text 不同，这里没有 cap。当前交付的工具没有这样做，但相比 details 只能 replace 的时期，现在打开了这扇门。
 
-### 2.2 Partial output survives failure
+### 2.2 部分输出在失败后保留
 
-Today `executeToolCall` catches and returns `createErrorToolResult(message)`,
-building a fresh result from the error string alone — a tool that streamed 8 KB
-and then threw reports only the error.
+当前 `executeToolCall` 捕获错误并返回 `createErrorToolResult(message)`，只从 error string 构造新 result——一个已经流式输出 8 KB 后抛错的 tool 最终只报告 error。
 
-With the sink, what was written is already the result. The harness appends the
-error text as content and keeps the rest. The error text is model-visible
-content, not presentation: the model needs to read why the call failed.
+使用 sink 后，已经写入的内容就是 result。Harness 将 error text 追加为 content，并保留其余内容。Error text 是模型可见的 content，不是 presentation：模型需要读取调用失败的原因。
 
-`abortedMessage` and `interruptedMessage` should be made consistent with this;
-today they build replacement results via `syntheticMessage`, so a cancelled
-long-running command loses its partial output too.
+`abortedMessage` 和 `interruptedMessage` 也应与此一致；当前它们通过 `syntheticMessage` 构造替换 result，因此取消的长命令也会丢失局部输出。
 
 ## 3. Content
 
-Content is exactly **one text block followed by zero or more image blocks**. A
-tool cannot interleave text between images — text written before and after an
-image lands in the same block. Deliberate: truncation only ever touches a string,
-and an image is never partially anything.
+Content 恰好是**一个 text block，后跟零个或多个 image block**。Tool 不能在图片之间交错 text——图片前后写入的 text 会落在同一个 block 中。这是有意设计：截断只处理字符串，图片不会成为部分内容。
 
-Images are **never windowed**. A byte or line cap over base64 payloads is
-meaningless and `truncateTail` operates on text. `maxBytes` / `maxLines` govern
-text only.
+Image **永远不做窗口化**。对 base64 payload 施加 byte 或 line cap 没有意义，而 `truncateTail` 作用于 text。`maxBytes`/`maxLines` 只约束 text。
 
-### 3.1 Retention mode
+### 3.1 保留模式
 
-Declared on the tool definition:
+在 tool definition 中声明：
 
 ```ts
 output?: {
@@ -149,36 +113,25 @@ output?: {
 }
 ```
 
-**`head`** — append until the cap, then stop. Nothing is ever removed. Right for
-output meaningful from the start: file reads, listings, greps.
+**`head`**——追加到上限，之后停止。永远不删除内容。适合从开头就有意义的输出：文件读取、列表、grep。
 
-**`tail`** — a rolling window. Right for anything whose interesting part is at
-the end: builds, test runs.
+**`tail`**——滚动窗口。适合有趣内容在末尾的场景：build、test run。
 
-Head+tail is **not** offered. `truncate.ts` exports `truncateHead` and
-`truncateTail`; neither combines them and none is being added.
+不提供 head+tail。`truncate.ts` 导出 `truncateHead` 和 `truncateTail`；二者不会组合，也不会新增组合函数。
 
-### 3.2 The tool does not truncate — the exec env does
+### 3.2 Tool 不负责截断——exec env 负责
 
-For output originating in the execution environment, capping, coalescing and
-spilling happen **at the source**. See [`execenv.md`](../03-execenv/execenv.md). The tool passes its
-`ShellOutputLimits` into `env.exec` and pipes the resulting updates into the sink.
+对于源自 execution environment 的输出，cap、coalescing 和 spill 都发生在**源端**。见 [`execenv.md`](../03-execenv/execenv.md)。Tool 将 `ShellOutputLimits` 传给 `env.exec`，并把生成的更新导入 sink。
 
-This is not a convenience. Reading a 1 GB file on a sandbox host must not ship
-1 GB to the agent machine to be capped there, and the spill file must land where
-the model's own `read` and `grep` run.
+这不是便利设计。Sandbox host 读取 1 GB 文件时不能先把 1 GB 传到 agent machine 再在那里截断，spill file 也必须落在模型自己的 `read` 和 `grep` 运行处。
 
-For output originating on the agent machine (subagents, in-process work),
-`ToolOutput` applies the same logic locally. Same code, different location.
+对于源自 agent machine 的输出（subagent、进程内工作），`ToolOutput` 在本地执行相同逻辑。代码相同，位置不同。
 
-Note this reverses an earlier decision that there is no spill in the sink and a
-temp-file path is tool-specific. The exec-env argument — model reachability
-across a machine boundary — is what changed it.
+注意，这反转了早先“sink 中不做 spill、临时文件路径属于 tool”的决策。改变它的是 exec-env 参数：跨机器边界的模型可达性。
 
 ## 4. Tool output state
 
-`tool_update` carries `Op[]` (`delta.md` §6) targeting the invocation's
-`ToolOutputState`:
+`tool_update` 携带面向 invocation `ToolOutputState` 的 `Op[]`（`delta.md` §6）：
 
 ```ts
 interface ToolOutputState {
@@ -191,22 +144,15 @@ interface ToolOutputState {
 }
 ```
 
-Ops rather than a typed variant union, for one decisive reason: **only ops give
-details granularity without the harness knowing `TDetails`**. A typed union would
-need per-tool recipes, which is the machinery §2.1 deletes.
+选择 op 而不是 typed variant union，有一个决定性理由：**只有 op 能在 Harness 不知道 `TDetails` 的情况下提供 details 粒度。** Typed union 需要每个 tool 的 recipe，而 §2.1 正是在删除这套 machinery。
 
-Text still gets delta treatment, because the sink applies the cap *before*
-mutating, so a rolling window produces `truncate` + `append` on
-`content[0].text` rather than a whole-value set.
+Text 仍进行 delta 处理，因为 sink 在 mutation 前应用 cap，因此滚动窗口会在 `content[0].text` 上产生 `truncate` + `append`，而不是 whole-value set。
 
-Interned ops also measure **smaller than a typed frame vocabulary** on every
-workload, and 10x smaller on details, because a frame repeats `toolCallId` where
-an interned op carries one integer. See `delta.md` §4.1.
+在所有工作负载上，interned op 测量结果也**小于 typed frame vocabulary**；details 上小 10 倍，因为 frame 会重复 `toolCallId`，而 interned op 只携带一个整数。见 `delta.md` §4.1。
 
-There is no `drop` event. The sink knows what it evicted and expresses it as
-`truncate`; a consumer needs no separate signal and derives nothing.
+不存在 `drop` event。Sink 知道淘汰了什么，并通过 `truncate` 表达；consumer 不需要额外 signal，也不会派生任何内容。
 
-## 5. Harness events
+## 5. Harness event
 
 ```ts
 | { type: "tool_start";
@@ -222,38 +168,17 @@ There is no `drop` event. The sink knows what it evicted and expresses it as
     isError: boolean }
 ```
 
-**`tool_start` carries identity only.** An earlier draft added `caps` and
-`initial`; both were redundant and are gone. The first batch is always a base batch
-(`delta.md` §6), so the initial state arrives on the update channel — carrying it
-twice means two ways to establish the base, which can disagree. And `caps` are
-already inside the state: `ToolOutputState.truncation` carries `maxBytes` and
-`maxLines`, which is what a renderer needs to say "50 KB limit". The draft itself
-conceded a consumer "no longer has to" fold identically, since the producer's ops
-encode eviction — that was the last reason for `caps` to travel, and it does not
-hold.
+**`tool_start` 只携带 identity。** 早期草稿增加了 `caps` 和 `initial`；二者都多余，现已删除。第一批始终是 base batch（`delta.md` §6），因此初始 state 通过 update channel 到达——携带两次意味着有两种建立 base 的方式，可能互相不一致。Caps 已在 state 内：`ToolOutputState.truncation` 携带 `maxBytes` 和 `maxLines`，这是 renderer 表达“50 KB limit”所需的内容。草稿自己也承认 consumer“不再需要”做相同 fold，因为 producer 的 op 已编码 eviction；这是 caps 需要传输的最后理由，也不再成立。
 
-`tool_update` carries ops. A base batch travels the same channel as a delta,
-because a replacement is itself an op (`delta.md` §2) — there is no second shape. `message_update` has the identical shape
-(`message-update.md` §5.1); a consumer folds tool output and assistant output with
-one code path.
+`tool_update` 携带 op。Base batch 和 delta 走同一 channel，因为 replacement 本身就是一个 op（`delta.md` §2）——不存在第二种 shape。`message_update` 具有相同 shape（`message-update.md` §5.1）；consumer 使用一条代码路径 fold tool output 和 assistant output。
 
-**`tool_end` carries no content, no details, no usage, no terminate.** Every byte
-already went out. Re-sending would duplicate each base64 image at the moment
-nothing new has happened.
+**`tool_end` 不携带 content、details、usage 或 terminate。** 所有字节都已发出。没有新变化时重新发送会重复每个 base64 图片。
 
-> **The fold is the result.** Nothing a consumer folded is ever re-sent to
-> confirm it.
+> **Fold 就是结果。** Consumer fold 过的任何内容都不会再次发送来确认。
 
-This dissolves an earlier open question about settle-time truncation disagreeing
-with the running fold. There is no separate settle-time truncation: the sink's
-window *is* the truncation. Anything a tool wants to add at the end — bash's
-`[Showing lines 8000-8123 of 8123]` footer — is `out.write(footer)`, one more
-append.
+这消除了一个早期开放问题：settle-time truncation 是否会与运行中的 fold 不一致。不存在独立的 settle-time truncation：sink 的 window **就是** truncation。Tool 想在末尾追加的内容——例如 bash 的 `[Showing lines 8000-8123 of 8123]` footer——就是 `out.write(footer)`，再做一次 append。
 
-The harness still assembles `AgentToolResult` in process for the model, and
-`createToolResultMessage` still writes the settled `ToolResultMessage` to the
-transcript with `content`, `details`, `usage`, `addedToolNames`, `isError`.
-Neither is a wire event.
+Harness 仍会在进程内为 model 组装 `AgentToolResult`，`createToolResultMessage` 仍将已结算的 `ToolResultMessage` 用 `content`、`details`、`usage`、`addedToolNames`、`isError` 写入 transcript。二者都不是 wire event。
 
 ## 6. Lane reduction
 
@@ -261,72 +186,42 @@ Neither is a wire event.
 export function reduceLaneSnapshot(view: LaneView, event: HarnessEvent): void;
 ```
 
-Plain mutation on a plain object. No `Draft`, no `produce`, no Immer, and **no
-`Rebase` return value** — a fold that cannot apply an event leaves state alone,
-and the host sends a `replace`. (An earlier draft had `void | Rebase`; under
-Immer that throws, and without Immer there is nothing to return to. Note
-`reducer.ts:4` currently defines `LaneSnapshotReduction = LaneSnapshot | { rebase: true }`,
-so this is a real change to existing code, and `navigation_end` is the event that
-drives it.)
+在普通对象上做普通 mutation。没有 `Draft`、`produce`、Immer，也没有 **`Rebase` 返回值**——无法应用 event 的 fold 保持 state 不变，宿主发送 `replace`。（早期草稿有 `void | Rebase`；在 Immer 下会抛错，不使用 Immer 时没有可返回的内容。注意 `reducer.ts:4` 当前定义 `LaneSnapshotReduction = LaneSnapshot | { rebase: true }`，因此这是对现有代码的真实变更，驱动它的 event 是 `navigation_end`。）
 
-The event is the only input besides the view. No registry, no `resolve`, no tool
-code — so a tool rewritten between crash and resume cannot make a persisted
-stream unreadable.
+除了 view，event 是唯一输入。没有 registry、resolve 或 tool code，因此 crash 和 resume 之间改写 tool 不会让持久流无法读取。
 
-When the harness is wrapped by a facet, the same mutation runs under the tracker
-from `delta.md` and ops fall out. The harness itself does not know this.
+Harness 被 facet 包装时，同一个 mutation 在 `delta.md` 的 tracker 下运行，并自然产生 op。Harness 自身无需知道这些。
 
-## 7. Durability
+## 7. 持久化
 
-### 7.1 What exists today
+### 7.1 当前存在的内容
 
-`pendingToolOutput(operationId, invocationId)` is a
-`value<AgentToolResult<unknown>>`, and — importantly — `progress.write(partial)`
-fires **only** when `options?.checkpoint === true` (`drive/tools.ts:325`). Not on
-every update. bash checkpoints every 2 s with a `JSON.stringify` dedupe; every
-other tool never checkpoints at all.
+`pendingToolOutput(operationId, invocationId)` 是 `value<AgentToolResult<unknown>>`；重要的是，`progress.write(partial)` **只有在 `options?.checkpoint === true` 时**才触发（`drive/tools.ts:325`），不会在每次 update 触发。Bash 每 2 秒 checkpoint，并用 `JSON.stringify` 去重；其他工具从不 checkpoint。
 
-It is also **not a progress buffer**. It is the interruption checkpoint. On
-resume, if the tool is not replay-safe, `readCheckpoint` turns it into a real
-`ToolResultMessage` for the model: `[...checkpoint.content, INTERRUPTION_MARKER]`
-plus `details` and `usage`.
+它也**不是 progress buffer**，而是 interruption checkpoint。Resume 时，如果 tool 不是 replay-safe，`readCheckpoint` 会把它变成真正的 `ToolResultMessage`：`[...checkpoint.content, INTERRUPTION_MARKER]` 加 `details` 和 `usage`。
 
-Note the implication that misled an earlier draft: because the checkpoint must
-*be* the current state, it was read as needing `value` semantics. It does not. It
-needs to be *derivable*, and folding encoded batches from the last base batch derives it — which is the point of tagging base batches (§7.3). `checkpoint: true`
-requests a durable write, not a replacement.
+这解释了早期草稿为何误以为 checkpoint 必须采用 `value` 语义：因为 checkpoint 必须**是**当前 state。其实它只需要可派生；从最后一个 base batch 折叠编码 batch 即可派生，这也是 base batch 需要标记的原因（§7.3）。`checkpoint: true` 请求持久写入，而不是 replacement。
 
-`pendingAssistantFrames` is a `list<AssistantMessageFrame>` appended per frame,
-`deleteList` on settle in `response.ts:345`, `deferred.ts:157`, `terminal.ts:47`.
+`pendingAssistantFrames` 是按帧 append 的 `list<AssistantMessageFrame>`，在 `response.ts:345`、`deferred.ts:157` 和 `terminal.ts:47` 的 settle 时 `deleteList`。
 
-Note `operationCleanupWrites` (`terminal.ts:26`) does four `scanValues` calls to
-enumerate what to delete at settle. Under scopes, the two covering
-`operationToolMemoPrefix` and `pendingToolOutputPrefix` are replaced by a single
-`retireScope(operationId)`.
+注意 `operationCleanupWrites`（`terminal.ts:26`）会调用四次 `scanValues`，列出 settle 时要删除的内容。在作用域方案下，覆盖 `operationToolMemoPrefix` 和 `pendingToolOutputPrefix` 的两次扫描由一个 `retireScope(operationId)` 替代。
 
-### 7.2 Renaming
+### 7.2 重命名
 
-`pendingAssistantFrames` → **`pendingAssistantOutput`**, matching
-`pendingToolOutput`. Frames stop being the durable unit; both addresses now hold
-tracked state written as ops or snapshots.
+`pendingAssistantFrames` → **`pendingAssistantOutput`**，与 `pendingToolOutput` 一致。帧不再是 durable unit；两个 address 现在都保存以 op 或 snapshot 写入的 tracked state。
 
-### 7.3 What to write, and when
+### 7.3 写什么、何时写
 
-Both addresses are **ephemeral-scoped** ([scopes.md](../02-scopes/scopes.md)), so they live in a
-sidecar retired on settle rather than in the main log forever.
+两个 address 都是**临时作用域**（[scopes.md](../02-scopes/scopes.md)），因此位于 settle 时 retire 的 sidecar 中，而不是永久留在主日志。
 
-Two independent wins, in order of importance:
+两项独立收益，按重要性排序：
 
-- **Encoding.** Ops instead of whole values, plus address interning: 93.89 MB to
-  5.32 MB in a single file, no change to atomicity. Do this first.
-- **Scopes.** Pending state leaves the main log entirely: 5.32 MB to 0.06 MB
-  surviving.
+- **编码。** 使用 op 而不是完整 value，加 address interning：单文件从 93.89 MB 降至 5.32 MB，原子性不变。先做这个。
+- **作用域。** Pending state 完全离开主日志：从 5.32 MB 降至 0.06 MB 的存活内容。
 
-**Both are `list<WireOp[]>`**, not values. The sink owns one stateful Chord encoder/decoder pair per durable value stream. One encoded batch is appended per flush, and a logical batch whose first op is `r` is tagged `"base"` on the storage record.
-Recovery reads backwards with `stopAtTag: "base"` and applies forward
-([delta.md §9](../01-delta/delta.md#9-durable-form), [scopes.md §11](../02-scopes/scopes.md#11-list-tags-and-stop-conditions)).
+**二者都是 `list<WireOp[]>`，不是 value。** Sink 为每条持久 value stream 持有一个有状态的 Chord encoder/decoder pair。每次 flush 追加一个编码 batch；第一个 op 是 `r` 的逻辑 batch，在 storage record 上标记为 `"base"`。恢复时使用 `stopAtTag: "base"` 反向读取，再正向应用（[delta.md §9](../01-delta/delta.md#9-durable-form)、[scopes.md §11](../02-scopes/scopes.md#11-list-tags-and-stop-conditions)）。
 
-Writing one flush:
+一次 flush 的写入：
 
 ```ts
 const ops = out.flush();
@@ -335,38 +230,29 @@ const wire = enc.encode(ops);
 writes: [appendList(address, wire, isBase(ops) ? "base" : undefined)];
 ```
 
-`isBase` comes from Chord. It checks for the root replacement op `r`; ordinary nested sets use `s`. Classification lives beside the vocabulary so the comparison is written once.
+`isBase` 来自 Chord。它检查 root replacement op `r`；普通嵌套 set 使用 `s`。分类逻辑位于词汇旁边，因此比较只编写一次。
 
-The landed tracker emits structural ops unconditionally. There is no serialized-size comparison or adaptive replacement heuristic. A producer requests a base batch explicitly with `rebase()`; the output sink's cap bounds that replacement, while periodic rebasing bounds recovery work. Production remeasurement rejects a text-specific append/truncate API: the generic path measured 2.43–2.46 µs per 50 KB rolling-window flush locally, below surrounding costs. Keep ordinary tracked string mutation; see the [decision record](../01-delta/append-decision.md).
+已落地 tracker 无条件发出 structural op。没有 serialized-size comparison 或 adaptive replacement heuristic。Producer 通过 `rebase()` 显式请求 base batch；output sink 的 cap 限制 replacement，周期性 rebase 限制 recovery work。生产环境重新测量拒绝文本专用 append/truncate API：本地测得 50 KB rolling-window flush 为 2.43–2.46 µs，低于周边开销。保留普通 tracked string mutation；见 [decision record](../01-delta/append-decision.md)。
 
-**Checkpointing is not deleted.** `BASH_CHECKPOINT_INTERVAL_MS` remains only as an interim compatibility mechanism. The generic sink owns durable frequency because Shell cannot price a storage write or enforce memo/output atomicity. Forced memo, terminal, and recovery-base writes bypass ordinary pacing while remaining cap-bounded.
+**Checkpoint 没有删除。** `BASH_CHECKPOINT_INTERVAL_MS` 仅作为临时兼容机制保留。通用 sink 拥有 durable frequency，因为 Shell 无法衡量存储写入成本，也无法强制 memo/output atomicity。强制 memo、terminal 和 recovery-base write 会绕过普通 pacing，但仍受 cap 限制。
 
-### 7.4 Replay must seed, not discard
+### 7.4 Replay 必须取 seed，不能丢弃
 
-`clearReplayCheckpoint` currently writes `deleteValue(pendingToolOutput(...))`
-before re-executing a replay-safe tool (`drive/tools.ts:257`). **This is a bug.**
+当前 `clearReplayCheckpoint` 会在重执行 replay-safe tool 前写入 `deleteValue(pendingToolOutput(...))`（`drive/tools.ts:257`）。**这是一个 bug。**
 
-Replay-safe means the tool is re-executed, but memos exist precisely so it does
-*not* redo work it already did — and skipped work emits nothing. Any output for
-memoised work is lost today.
+Replay-safe 意味着 tool 会重执行，但 memo 存在的目的正是让它**不**重复已经完成的工作；而跳过的工作不会发出任何内容。因此 memoized work 的 output 当前会丢失。
 
-The fix: seed a fresh `ToolOutput` from the durable state, then re-execute. The
-tool appends to a sink that already holds what it produced before the crash.
+修复方式：从 durable state 为新的 `ToolOutput` 取 seed，然后重执行。Tool 会追加到已经持有崩溃前产出内容的 sink。
 
-This is also why nothing may be settle-only. `usage` and `addTools` must survive
-a seed, so they flow through the sink like everything else.
+这也是为什么任何内容都不能是 settle-only。`usage` 和 `addTools` 必须在 seed 后保留，因此像其他内容一样经过 sink。
 
-### 7.5 The memo invariant
+### 7.5 Memo 不变量
 
-> A tool's memo write and its output checkpoint must commit in the same
-> transaction.
+> Tool 的 memo write 和 output checkpoint 必须在同一个 transaction 中提交。
 
-Otherwise a tool does work, sets a memo, crashes before the next checkpoint, and
-on replay skips the work while the seeded output has no record of it.
+否则，tool 完成工作、设置 memo，却在下一次 checkpoint 前崩溃；Replay 会跳过工作，而 seeded output 没有该工作的记录。
 
-**This does not hold today.** `setMemo` (`drive/tools.ts:112`) and `openProgress`
-(`runtime/progress.ts:44`) are two separate `lane.command` calls, hence two
-transactions. Making it hold means bundling the checkpoint into the memo's commit:
+**当前不满足。** `setMemo`（`drive/tools.ts:112`）和 `openProgress`（`runtime/progress.ts:44`）是两个独立的 `lane.command` call，因此是两个 transaction。要满足它，必须把 checkpoint 绑定到 memo 的 commit：
 
 ```ts
 setMemo(name, value) {
@@ -388,75 +274,45 @@ setMemo(name, value) {
 }
 ```
 
-Both addresses are **ephemeral-scoped**, so this is a single-file transaction and
-statically enforced as one ([scopes.md §3 and §6](../02-scopes/scopes.md)). `operationToolMemo` is
-placed in that scope precisely for this. Ordering on the Session line would not be
-enough — two file writes are not atomic. The periodic checkpoint stays as it
-is — best-effort, for the interruption path; this forces one where correctness
-requires it.
+两个 address 都是**临时作用域**，因此这是单文件 transaction，并由静态检查强制为一个 transaction（[scopes.md §3 和 §6](../02-scopes/scopes.md)）。`operationToolMemo` 正是为此放入该作用域。仅靠 Session line 的排序不够——两个文件写入不具备原子性。Periodic checkpoint 保持不变，作为 interruption path 的 best-effort；此处会在正确性要求时强制写入一次。
 
-The invariant holds because the tool does X, writes X's output to the sink, *then*
-calls `setMemo("did X")` — so the sink's state at commit time already contains X's
-output.
+该不变量成立，是因为 tool 做完 X，将 X 的 output 写入 sink，*然后*调用 `setMemo("did X")`——因此 commit 时 sink state 已经包含 X 的 output。
 
-**Ordering alone does not work**, in case it looks tempting:
+**仅靠排序不起作用**，尽管它看起来很诱人：
 
-- memo first, checkpoint second → crash between → replay skips X and the seeded
-  output lacks it → silent loss;
-- checkpoint first, memo second → crash between → replay redoes X and appends
-  again → duplicated output.
+- memo first、checkpoint second → 中间崩溃 → replay 跳过 X，seeded output 缺少它 → 静默丢失；
+- checkpoint first、memo second → 中间崩溃 → replay 重做 X，再次 append → output 重复。
 
-Duplication is the less bad failure, so ordered writes are a tolerable fallback,
-but neither is correct.
+重复是较轻的失败，因此有序写入是可容忍的 fallback，但二者都不正确。
 
-**Cost:** `setMemo` now writes a full capped output state rather than a small
-value. Memos are rare — a handful per invocation — so this is bounded by
-`memo count x cap`, not by output volume.
+**成本：** `setMemo` 现在写完整的有界 output state，而不是小 value。Memo 很少见——每次 invocation 只有少数几个——所以它受 `memo count x cap` 限制，而非 output volume 限制。
 
-### 7.6 `openProgress` has a write-ordering race
+### 7.6 `openProgress` 存在写入排序竞态
 
-`commitWrite(item)` captures `item` when `write()` is called, and the write is
-fire-and-forget with only `latest` tracked. A checkpoint captured at T1 can
-therefore commit *after* a memo-bundled checkpoint at T2, overwriting newer state
-with older — reintroducing exactly the loss §7.5 prevents.
+`commitWrite(item)` 在调用 `write()` 时捕获 `item`，写入采用 fire-and-forget，仅跟踪 `latest`。因此 T1 捕获的 checkpoint 可能在 T2 的 memo-bundled checkpoint 之后提交，用旧 state 覆盖新 state，重新引入 §7.5 正要阻止的丢失。
 
-Fix: resolve the sink's state inside the command planner rather than at call time.
+修复：在 command planner 中解析 sink state，而不是在调用时解析。
 
 ```ts
 commitWrite: () => setValue(address, out.snapshot())   // evaluated under the Session line
 ```
 
-`lane.command` serializes on the Session line, so checkpoint writes become
-monotonic by construction. This removes the race generally, not only against
-memos.
+`lane.command` 在 Session line 上串行化，因此 checkpoint write 从构造上按单调顺序完成。这一般性地移除了竞态，而不只是在 memo 场景中移除。
 
-### 7.7 Nothing on the durable path runs tool code
+### 7.7 Durable path 不运行 tool code
 
-Ops are interpreted by a six-verb applier with no domain knowledge, so a tool
-rewritten between crash and resume cannot make a persisted stream unreadable.
+Op 由不具备 domain knowledge 的六 verb applier 解释，因此 crash 和 resume 之间重写 tool 不会让持久流无法读取。
 
-> **The durable path uses only harness-owned reducers.**
+> **Durable path 只使用 Harness-owned reducer。**
 
-This also rules out persisting *facet* ops. The harness has no facet state,
-facets come and go, and a recovering harness must rebuild its working values with
-no facet present.
+这也排除了持久化 facet op。Harness 没有 facet state，facet 会来去，恢复中的 Harness 必须在没有 facet 的情况下重建工作 value。
 
-## 8. Open questions
+## 8. 开放问题
 
-- **Property tests for the tracker** (`delta.md` §3.3). Everything here rests on
-  producer and replica agreeing; nothing currently proves they do.
-- Coalescing window: per tick, or a byte/time threshold.
-- Whether image count needs a bound. Images are unwindowed, so a tool pushing
-  them in a loop grows `content` without limit. Currently treated as a tool bug.
-- Whether details need a bound for the same reason (§2.1).
-- Whether `retain: "head"` should keep emitting counter-only updates once capped
-  so a renderer can report how much was suppressed. [`execenv.md`](../03-execenv/execenv.md) answers this
-  for exec-originated output; agent-side output needs the same answer.
-- Whether a failing tool *should* be able to terminate, or whether the current
-  inability is deliberate — there is a reasonable argument the model should
-  receive the error and decide.
-- **Derived values.** `arguments` parsed from accumulated JSON should not be
-  replicated; derive it on demand. Safe because `parseStreamingJson` is total —
-  four fallbacks ending in `{}`, it cannot throw — so a replica derives with no
-  error path and no agreement protocol. Generalises to: no derived fields in
-  replicated state.
+- **Tracker 的 property test**（`delta.md` §3.3）。本文一切都依赖 producer 和 replica 达成一致；当前没有任何证明它们确实一致。
+- Coalescing window：按 tick，还是按 byte/time threshold。
+- Image count 是否需要上限。Image 不做 window，因此循环 push image 的 tool 会无限增长 `content`。当前将其视为 tool bug。
+- Details 是否同样需要上限（§2.1）。
+- `retain: "head"` 达到上限后是否仍应发出只包含 counter 的 update，让 renderer 报告被抑制了多少。对于 exec-originated output，[`execenv.md`](../03-execenv/execenv.md) 已回答；agent-side output 需要相同答案。
+- 失败的 tool 是否应该能 terminate，还是当前不能 terminate 是有意设计——合理观点是模型应先收到 error，再自行决定。
+- **Derived value。** 从累积 JSON parse 得到的 `arguments` 不应复制；按需派生。因为 `parseStreamingJson` 是 total——四个 fallback 最终落到 `{}`，不会抛错——所以 replica 可以无 error path、无 agreement protocol 地派生。一般化为：复制 state 中不放 derived field。

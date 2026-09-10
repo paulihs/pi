@@ -1,240 +1,209 @@
-# WP08 — Named-branch and tree forks with streaming copies
+# WP08 — 命名分支与树分支的流式 fork
 
-**Status: in progress — implementing Slice A.**
+**状态：进行中，正在实现 Slice A。**
 
-This package replaces the fork contract: `ForkOptions` gains a mandatory scope and a mandatory named source branch, branch forks validate a complete configured source AgentLane and ancestry membership, tree forks copy the complete immutable tree plus current application values/lists, and all three backends replace materialized source snapshot arrays with bounded-memory streaming copies. A JSONL fork never repairs or mutates its source. One closed core classifier owns every namespace's fork disposition.
+本工作包替换 fork 契约：ForkOptions 必须指定 scope，branch scope 必须指定命名 source branch；分支 fork 校验完整且已配置的源 AgentLane 及其祖先关系；tree fork 复制完整不可变树以及当前应用值/列表；三个后端都使用有界内存的流式复制，不再物化源 snapshot 数组。所有 namespace 的 fork 规则由一个封闭的核心 classifier 统一负责。
 
-WP07 is a hard dependency and is preserved unchanged: no-create database modes, canonical `(containerPath, sessionId)` identity, independent read-only WAL reader for external/live-worker sources, repository-local deletion reservation, and all-settled close. This package supersedes only the roadmap's "SQLite fork cost" performance item.
+WP07 是硬依赖，以下行为保持不变：no-create 数据库模式、规范化的 (containerPath, sessionId) identity、面向外部/live-worker 源的独立只读 WAL reader、仓库级删除 reservation、all-settled close。本包只替代 roadmap 中的 SQLite fork cost 性能事项。
 
-## 0. Mandatory reading
+## 0. 必读内容
 
-Read completely before editing:
+编辑前完整阅读：
 
-1. `packages/agent/docs/harness.md` §§0.6, 1.3–1.7, 2.3, 2.7–2.9, Part 9 (invariants 3–5, 13, 16; ledger completeness).
-2. `packages/agent/docs/values.md`, especially "Forks and rewrites" and the backend sections.
-3. `packages/agent/docs/post-wp05-roadmap.md` (SQLite fork cost, repository lifecycle context).
-4. Completed WP06 §7 and WP07 (historical; do not edit them).
-5. `packages/agent/src/harness/session/fork.ts`, `types.ts` (`ForkOptions`, `SessionRepo`), `values.ts`, `in-memory-storage-state.ts`, `memory.ts`, `session/index.ts`.
-6. `packages/agent/src/harness/session/jsonl/repo.ts`, `jsonl/storage.ts`, `jsonl/codec.ts`, `jsonl/legacy-v3.ts`, `jsonl/types.ts`.
-7. `packages/session-backends/sqlite-node/src/sqlite/repo.ts`, `storage.ts`, `session/values.ts`, `session/entries.ts`, `session/branch-entries.ts`, `types.ts`.
-8. `packages/agent/src/harness/session/testing/conformance/session-repo.ts` and every test named in §5.
-9. `packages/agent/src/harness/session/testing/benchmark/session-repo.ts` and both `session-repo.bench.ts` files.
+1. harness.md 中关于 fork、invariant 和 ledger completeness 的相关章节；
+2. values.md 的 Forks and rewrites 与各后端章节；
+3. post-wp05-roadmap.md 的 SQLite fork cost 和 repository lifecycle；
+4. 已完成的 WP06、WP07，历史文档不得修改；
+5. session fork/types/values、Memory、Session；
+6. JSONL repo/storage/codec/legacy-v3/types；
+7. sqlite-node 的 repo、storage、session values/entries/branch-entries/types；
+8. §5 点名的 conformance 和测试；
+9. benchmark 的 session-repo 实现与两个 benchmark 文件。
 
-Do not use `dist/` output as implementation input. WP00–WP07 documents and released changelog sections are immutable in this package.
+不要使用 dist/ 作为实现输入。WP00–WP07 文档及已发布 changelog 不在本包范围内。
 
-## 1. Fixed architecture
+## 1. 固定架构
 
-### 1.1 Public contract
+### 1.1 公开契约
 
-```ts
+~~~ts
 export type ForkOptions =
-	| { scope: "branch"; branch: string; entryId?: string; position?: "before" | "at"; id?: string }
-	| { scope: "tree"; id?: string };
-```
+  | { scope: "branch"; branch: string; entryId?: string; position?: "before" | "at"; id?: string }
+  | { scope: "tree"; id?: string };
+~~~
 
-`scope` is required. `branch` is required for branch scope. There is no default scope, no implicit `main`, and no compatibility alias.
+scope 必填，branch scope 的 branch 必填；没有默认 scope、隐式 main 或兼容别名。
 
-**Branch scope** requires a complete configured source AgentLane: `pi.branch.tip/{branch}`, `pi.lane.config/{branch}`, and `pi.lane.state/{branch}` must all exist. A missing tip rejects (`unknown branch`); a data-only Branch (tip without config/state) rejects; a partial config/state pair, or `laneConfig`/`laneState` present without a `branchTip`, is corruption and rejects. `entryId`, when supplied, must be an entry on that Branch's current tip ancestry (inclusive); an entry elsewhere in the tree rejects. Omitted `entryId` means the current tip. `position` defaults to `"at"`; `"before"` selects the target's parent and may yield a `null` destination tip (before the root entry, or a `null` source tip with no `entryId`) — legal. The destination contains exactly one Branch with the same name, the selected tip, the copied `LaneConfiguration`, and fresh idle lane state `{ currentOperationId: null, lastOperationId: null, inbox: [] }`. No other Branch or lane exists in the destination.
+Branch scope 要求源 AgentLane 完整且已配置：pi.branch.tip/{branch}、pi.lane.config/{branch}、pi.lane.state/{branch} 必须同时存在。缺少 tip 是 unknown branch；只有 tip 的 data-only Branch 拒绝；config/state 部分缺失，或没有 branchTip 却存在 laneConfig/laneState，视为存储损坏并拒绝。
 
-This deliberately makes branch forks of data-only Branches — including legacy v3 imports whose main lacked reconstructable model/thinking history — unavailable. Tree scope remains available for those sources.
+如果指定 entryId，它必须位于该 Branch 当前 tip 的祖先链上（包含 tip）；树中其他位置的 entry 拒绝。未指定 entryId 时使用当前 tip。position 默认 at；before 选择目标 entry 的 parent，根 entry 之前可以得到 null tip，这是合法结果。目标只包含一个同名 Branch、选中的 tip、复制的 LaneConfiguration，以及新的 idle lane state：
 
-**Tree scope** copies: every immutable entry, including entries unreachable from every current Branch tip; every Branch tip verbatim; every configured lane's config plus fresh idle lane state under the same name; data-only Branches (tip present, config/state absent) as data-only Branches. A partial config/state pair, or `laneConfig`/`laneState` without a `branchTip`, is corruption in both scopes: tree scope **rejects** it rather than dropping it.
+~~~ts
+{ currentOperationId: null, lastOperationId: null, inbox: [] }
+~~~
 
-**Both scopes**: copy `pi.session.name`; copy `pi.entry.label` values only for copied entries; exclude the usage ledger, `pi.result`, all `pi.op.*`, all `pi.pending.*` (entries, tool checkpoints, assistant frames), and every trace of open-operation state. Destination usage totals start at zero; destination `messageCount` equals the number of copied message entries, exactly as current conformance already proves. Destination metadata records `parentSessionId = source.id`. Copied entries, values, and list elements preserve their original `seq`; the destination `nextSeq` high-water mark is the source's, so no sequence is reused. Transformed built-ins keep coherent seqs: the rewritten `branchTip` and each fresh idle `laneState` reuse the seq of the source's current corresponding value row, and copied config, name, labels, application values, and list elements retain theirs — destination writes stay in original seq order under an unchanged high-water mark.
+目标中没有其他 Branch 或 lane。data-only Branch 不可用于 branch fork；tree fork 仍可复制它。
 
-**Application values/lists (outside the reserved `pi`/`pi.*` namespaces)**: tree scope copies every current scalar value and every surviving list element with original seqs; branch scope copies none. A `seq <= tipSeq` cutoff is forbidden as "historical reconstruction" — it is provably not one:
+Tree scope 复制：
 
-```text
-Scalar: TX[seq 10: set my-app.state = v1] · TX[seq 12: insert e1] ·
-        TX[seq 50: set my-app.state = v2]     (v2 describes work after e1)
-Branch fork at e1, cutoff seq <= 12: only v2 exists (v1 was replaced, no
-history is retained); 50 > 12 excludes it → state absent, though the app
-demonstrably had state v1 at the fork point. The cutoff cannot recover v1.
+- 所有不可变 entry，包括不在任意当前 Branch tip 可达路径上的 entry；
+- 所有 Branch tip；
+- 每个已配置 lane 的 config 和同名的新 idle state；
+- data-only Branch，仍保持 data-only；
+- 部分 config/state 组合则视为损坏并拒绝，而不是静默丢弃。
 
-List:   append seq 5 · append seq 20 · deleteList seq 40 · append seq 60
-Cutoff seq <= 30: elements 5 and 20 no longer exist (whole-list delete
-destroyed them); only 60 survives and is excluded → empty list, though the
-list held {5, 20} at seq-30 time.
-```
+两种 scope 都复制 pi.session.name，并且只为实际复制的 entry 复制 pi.entry.label；排除 usage ledger、pi.result、全部 pi.op.*、全部 pi.pending.* 以及所有活动 operation 状态。目标 usage 从零开始，messageCount 等于复制的 message entry 数量。目标元数据记录 parentSessionId = source.id。复制的 entry、value 和 list element 保留原 seq；目标 nextSeq 保持源 high-water mark，不能复用序号。被改写的 branchTip 和新的 idle laneState 使用源对应当前 value row 的 seq。
 
-Any cutoff filters *survivors*, silently mixing rewound intent with post-deletion reality. Branch scope therefore copies nothing application-owned, matching its fresh idle lane state and zero ledger; applications own their own re-derivation.
+应用 namespace（不属于 pi 或 pi.*）的规则是：tree scope 复制当前所有 scalar value 和存活的 list element，并保留 seq；branch scope 一个也不复制。禁止用 seq <= tipSeq 作为“历史重建”：
 
-### 1.2 One closed fork classifier
+~~~text
+标量：seq 10 写入 v1，seq 12 写入 entry，seq 50 将同一值替换为 v2。
+在 entry 处分支时，v1 已被替换且没有历史，按 seq 截断只能看到 v2 被排除，无法恢复分支时的 v1。
 
-All namespace fork knowledge lives in one core module beside `session/values.ts` and `session/fork.ts` (e.g. `session/fork-policy.ts`). It is a closed switch, not a registry, plugin policy, or DSL:
+列表：seq 5、20 追加，seq 40 整表删除，seq 60 再追加。
+按 seq <= 30 截断时，5 和 20 已因整表删除不存在，60 又被排除，错误得到空列表。
+~~~
 
-- `pi.op.*`, `pi.pending.*`, `pi.result` → exclude, both scopes.
-- `pi.session.name` → copy.
-- `pi.entry.label` → copy iff the keyed entry is copied.
-- `pi.branch.tip`, `pi.lane.config`, `pi.lane.state` → structured lane actions; the scope-specific rules (branch keeps only the named lane and rewrites its tip; lane state is always replaced with fresh idle state; tree keeps all) live in one shared driver consumed by all backends.
-- The exact namespace `pi` and any other `pi.*` namespace → the fork **fails**, but only when current surviving state exists at fork time (a current scalar row or a surviving list element). Historical writes later replaced or deleted are absent from current state on every backend and must not alone fail a JSONL fork — behavior is backend-equivalent. Introducing a new built-in namespace without declaring its fork semantics must break fork tests, not silently copy or drop state.
-- Neither `pi` nor `pi.*` → application: copy on tree, exclude on branch. The only built-in list namespace (`pi.pending.assistant_frame`) excludes; application lists follow the application rule.
+任何 cutoff 都只会过滤当前幸存者，不能恢复历史状态。因此 branch scope 不复制应用所有权的数据，由应用自行重新派生。
 
-The driver exposes a streaming shape — accept one committed value/list write (or current row), emit zero or more destination writes, `finish()` emits fresh idle lane states and the rewritten branch tip — holding only bounded state (lane names, destination tip). Entry-copy membership is a backend-supplied predicate so each backend uses its own index. `createForkSnapshot`, `forkSnapshotWrites`, `ForkSourceSnapshot`, `ForkDestinationSnapshot`, and the `entriesComplete` escape hatch are deleted.
+### 1.2 一个封闭的 fork classifier
 
-### 1.3 Bounded-memory backend procedures
+所有 namespace fork 知识集中在 session/values.ts 和 session/fork.ts 旁的核心模块（例如 session/fork-policy.ts），使用封闭 switch，不使用 registry、plugin policy 或 DSL：
 
-Auxiliary memory during a fork must stay bounded regardless of source size. The unavoidable exceptions are Memory's destination state and the returned open destination Session (JSONL destination state after open). Source copy paths must not call array-returning full reads: no `snapshotEntriesAndValues()`, `captureForkSource()`, `readAllScalarValueRows()`, `readAllEntryRows()`, whole-file `readTextFile`, or SQLite `.all()` over unbounded row sets.
+- pi.op.*、pi.pending.*、pi.result：两种 scope 都排除；
+- pi.session.name：复制；
+- pi.entry.label：仅当对应 entry 被复制时复制；
+- pi.branch.tip、pi.lane.config、pi.lane.state：由共享 driver 执行 scope 特定的 lane 操作；
+- 精确 namespace pi 或未声明的 pi.*：只有当当前仍存在 scalar row 或 list element 时才使 fork 失败；仅存在已替换/删除的历史写入不能使 fork 失败；
+- 其他 namespace：视为应用数据，tree 复制，branch 排除。
 
-**Memory.** At a source `commitQueue` boundary, build the destination `InMemoryStorageState` directly by iterating source maps once through the classifier/driver. Branch scope walks `parentId` from the branch tip toward the root to compute the ancestry id set and verify `entryId` membership; copy exactly that set. No intermediate snapshot arrays; `MemoryStorage.fromSnapshot` and `captureForkSource` are removed.
+driver 接收一个已提交的 value/list write 或当前 row，流式产生目标写入；finish() 产生新的 idle lane state 和改写后的 branch tip。只保留 lane 名和目标 tip 等有界状态。Entry 是否属于复制集合由后端索引提供。删除 createForkSnapshot、forkSnapshotWrites、ForkSourceSnapshot、ForkDestinationSnapshot 和 entriesComplete escape hatch。
 
-**JSONL.** The source is read through a read-only path that captures a fixed file prefix — open a read handle, record the current length at capture time, and read only that prefix — and never writes the source: no torn-tail truncation/rewrite, no v3 normalization persistence, no `.tmp` beside the source. A torn or incomplete final line inside the captured prefix is discarded in memory. The source `nextSeq` high-water mark is derived as `max(header.nextSeq when present, highest complete captured write seq + 1)` — ordinary headers are not rewritten on every append, and a torn incomplete final write never advances it.
+### 1.3 有界内存的后端流程
 
-- *Both scopes* use two passes over the captured prefix with one temporary disk-backed index (deleted in `finally` on success and failure). Pass 1 streams every line and folds value/list writes into the index: per scalar address, the seq of the current surviving `set` (absent after a trailing `delete`); per list address, the set of surviving element seqs (whole-list delete clears it); plus entry `id → parentId` (parents always precede children) where branch scope needs ancestry. The fold applies the same current-state semantics replay does, without whole-state RAM.
-- Pass 2 streams the prefix again in order and emits a write only when the index proves it current and the classifier selects it: an entry write in the selected set; a scalar `set` whose seq equals the index's current-row seq for its address; a list `append` whose element seq is in the survivor set. Deletes, superseded sets, and dead application value/list history are never emitted as destination state — the destination file contains only current selected rows, already in original seq order because source lines are seq-ordered.
-- Transformed built-ins emit in place: when pass 2 reaches the seq of the source's current `branchTip` row for a kept branch it emits the (possibly rewritten) tip under that same seq, and when it reaches the seq of the current `laneState` row for a kept configured lane it emits fresh idle lane state under that same seq. No tail appends exist, so replay stays seq-monotonic and the high-water mark is untouched.
-- *Branch scope* walks tip→root through the disk index to materialize the ancestry set on disk and verify `entryId` membership before pass 2; labels emit only for member entries.
-- The destination is staged in a temp file and atomically renamed (existing `publishFileAtomically`); failure removes the temp file and the index. Legacy v3 splits by source state. Forking an **open** legacy-v3 `JsonlStorage` **rejects with a clear error** until a normal non-empty commit has upgraded and persisted its normalized format-4 ids: v3 normalization mints nondeterministic UUIDv7 tails, so an independent disk reparse cannot reproduce the ids the open Session exposes or validate a caller `entryId`; the fork must not mutate/upgrade the source itself. A **closed** legacy-v3 source uses the bounded fixed-prefix disk-backed parser/normalizer and never touches the file: tree forks succeed; branch forks may use an omitted `entryId` (the default normalized tip) when the import reconstructs a complete configured lane, while any caller-supplied process-local id from an earlier open is not stable across reparses and rejects normally; a data-only reconstructed lane rejects as everywhere. Ordinary writable `JsonlStorage.open` may retain in-memory normalization, but resident state is never a fork source.
-- There is **no resident-state path**: an open same-repository JSONL source enqueues a short boundary callback on the source `commitQueue` whose only job is to capture the fixed read-only file-handle prefix (open handle, record length), then releases the queue; the fork runs the same two-pass disk-backed procedure over that prefix while later source appends proceed. Committed writes are durable in the file before they are applied to resident state, so the prefix is authoritative at the boundary, and file order preserves seq order without resident-Map ordering ambiguity.
+fork 辅助内存必须与源大小无关。不得调用返回无界数组的 full read，例如 snapshotEntriesAndValues、captureForkSource、readAllScalarValueRows、readAllEntryRows、whole-file readTextFile 或对无界 rows 使用 SQLite .all()。
 
-**SQLite.** Iterator-based row transfer through a bounded-memory temporary on-disk SQLite **staging database**, used uniformly for per-file and shared-container layouts. The source reader never streams directly into the destination transaction — a WAL reader and one writer can coexist, but in shared-container mode the destination writer would hold the container's sole write lock and block the post-boundary source writer while capture is still streaming; staging into a separate file removes that coupling. Use prepared-statement iteration (`iterate`/stepwise), never source-sized `.all()` snapshot arrays:
+**Memory：** 在 source commitQueue 边界直接创建目标 InMemoryStorageState；通过 classifier/driver 遍历源 map 一次。branch scope 从 tip 沿 parentId 向根行走，计算祖先集合并验证 entryId，只复制该集合，不构造中间 snapshot 数组。
 
-- *External/closed/live-worker source:* WP07 path — `openReadOnly` on the exact canonical path, one deferred read transaction, session row and storage version validated inside it.
-- *Same-repository open source:* open the independent read-only connection **first**, then enqueue a short boundary callback on the source Storage `commitQueue` whose only job is to `BEGIN` and establish the independent reader's snapshot (issue a trivial read) before releasing the queue. Do not begin a read transaction on the source writer connection and then release its queue, and do not hold the queue for the copy duration.
-- *Stage:* while the source reader remains open, stream selected entries `ORDER BY seq` and classifier-selected current scalar/list rows (SQL-level namespace prefilters matching the classifier — enumerated built-in namespaces plus the application predicate excluding exact `pi` and `pi.%` — with each row still passing the classifier) into the temporary staging database in bounded batches. Branch scope enumerates the ancestry through the `branch_entries` segment chain up to the selected entry and answers `entryId` and label membership through that index, not an in-RAM id set. Later source commits use the original writer connection and may complete while staging streams, in **both** layouts, because stage writes target another file.
-- *Publish:* close/commit the source read transaction, then stream the stage into one destination `BEGIN IMMEDIATE` transaction — entries in seq order maintaining the destination branch index and `message_count` incrementally, then values/list elements — and delete the staging database in `finally` on success and failure. Destination `next_seq` is the source's. Shared-container destinations write only the new session's rows.
+**JSONL：** 使用只读固定前缀：打开 reader，记录 capture 时文件长度，只读该前缀；绝不截断、重写、升级 source，也不在 source 旁创建 .tmp。前缀内不完整尾行只在内存中丢弃。nextSeq 取 header.nextSeq 与完整写入最高 seq + 1 的较大值。
 
-### 1.4 Preserved WP07 behavior
+两次流式扫描使用一个临时磁盘索引：
 
-Destination id reservation across create/open/fork/delete, no-create opens, foreign-metadata rejection, per-file and shared-container layouts, WAL commit-boundary wholeness (a source commit is wholly inside or wholly outside one fork), and all-settled repository close are unchanged.
+1. 第一次扫描折叠当前状态：每个标量地址保存当前 set 的 seq（尾随 delete 后为空），每个列表保存存活 element seq，整表 delete 会清空；同时保存 entry → parentId。
+2. 第二次按原始顺序扫描，只输出索引证明仍当前且 classifier 允许的内容：选中 entry、当前 scalar set、存活 list append。delete、被替换 set 和已死亡应用历史都不输出，因此目标文件只有当前状态，且 seq 顺序与源一致。
+3. 读取源当前 branchTip/laneState 时，在相同 seq 位置输出改写的 tip 和新 idle state，不追加尾部。
+4. branch scope 使用磁盘索引沿 tip→root 检查 ancestry 与 entryId；label 只为祖先 entry 输出。
+5. 目标先写入临时文件，再使用 publishFileAtomically 原子 rename；成功或失败都在 finally 删除索引和临时文件。
 
-### 1.5 Coding-agent status (record only)
+打开的 legacy-v3 JsonlStorage 在普通非空 commit 升级并持久化 format-4 ID 前，fork 必须返回清晰错误；fork 不能自己升级或修改 source。关闭的 v3 source 使用有界磁盘 parser/normalizer 且不修改源文件，tree fork 可用；branch fork 只有在能重建完整配置 lane 且未指定旧进程内 entryId 时可用。打开的普通 JSONL source 在 commitQueue 边界捕获只读前缀，释放队列后再执行两遍磁盘扫描；后续 append 可以继续，但不进入该 fork。
 
-`/fork`, `/clone`, and `--fork` run entirely on the legacy `SessionManager` (`createBranchedSession`, `forkFrom`) and are not migrated here. Future mapping when coding-agent adopts `SessionRepo`: `/fork` → `{ scope: "branch", branch: "main", entryId, position: "before" }`; `/clone` → `{ scope: "branch", branch: "main" }`; `--fork` → `{ scope: "tree" }`.
+**SQLite：** 通过有界内存的临时磁盘 SQLite staging database 传输 rows，统一支持 per-file 和 shared-container。源 reader 不能直接流入目标事务，否则 shared-container 的目标 writer 会阻塞源写入。
 
-## 2. Problems in current source
+- 外部/关闭/live-worker 源沿用 WP07：精确 canonical path 上 openReadOnly，单个 deferred read transaction 内校验 session row 和 storage version；
+- 同仓库 open source 先打开独立只读连接，再在 source commitQueue 边界 callback 中 BEGIN 并进行一次 trivial read 建立 reader snapshot，随后释放队列，不能占用队列执行整个复制；
+- source reader 保持打开时，按 seq 流式写入 staging：entry、classifier 允许的当前 scalar/list rows 分批写入，branch ancestry 通过 branch_entries 索引完成；
+- 关闭/提交 source read transaction 后，将 staging 流入目标单个 BEGIN IMMEDIATE 事务；最后在 finally 删除 staging。目标 next_seq 保持源值；shared-container 只写新 session 的 rows。
 
-- `ForkOptions` defaults `scope` to `"branch"` and hard-codes source/destination `main` (`fork.ts`, both backend branch readers).
-- No ancestry membership check: `selectForkContents` walks parents from any supplied `entryId` anywhere in the tree and labels the result `main`.
-- Every backend materializes the full source: `snapshotEntriesAndValues()` (Memory/JSONL), `readAllScalarValueRows` + `readAllEntryRows`/`scanBranchEntries` arrays (SQLite), all funneled through in-memory `createForkSnapshot`.
-- `createForkSnapshot` renumbers copied scalar values with fresh seqs and computes `nextSeq` as `max entry seq + 1`, losing original value seqs.
-- A JSONL fork of a closed source uses `JsonlStorage.open()`, which rewrites the source file on a torn tail — a fork can mutate its source today.
-- Lists are never copied; application values are excluded with no declared tree policy (`values.md` explicitly defers it).
-- Namespace fork knowledge is repeated across `fork.ts`, `values.md` prose, and conformance assertions; nothing forces a new `pi.*` namespace to declare fork semantics.
-- `entriesComplete?: false` exists only to let SQLite branch snapshots skip tip validation for other branches.
+### 1.4 保留 WP07 行为
 
-## 3. Required result
+跨 create/open/fork/delete 的目标 ID reservation、no-create open、foreign metadata 拒绝、per-file/shared-container 布局、WAL commit-boundary 完整性和 all-settled repository close 全部不变。
 
-1. `ForkOptions` and validation exactly as §1.1; all rejection paths create no destination file, database rows, or reserved-but-leaked ids.
-2. The closed classifier/driver of §1.2, exported from core and consumed by all three backends; unknown reserved namespaces (exact `pi` or undeclared `pi.*`) fail the fork only when current surviving state exists, identically on every backend.
-3. Streaming procedures of §1.3 on all three backends; `createForkSnapshot`/`captureForkSource`/`snapshot()` fork plumbing and their exports removed from `session/index.ts` and the sqlite-node import surface.
-4. Seq preservation (including reused seqs for rewritten tips and fresh idle lane states) and source `nextSeq` high-water on every backend (JSONL derives it per §1.3); identical logical destination state across backends for identical sources (conformance).
-5. JSONL source non-mutation, including torn-tail sources and legacy v3 sources.
-6. Documentation: `harness.md` §2.7 (and the §1.7 fork-related sentences), `values.md` "Forks and rewrites" and backend snapshot mentions, `post-wp05-roadmap.md` (retire the SQLite fork-cost item, add/point to this package), `packages/session-backends/sqlite-node/README.md` fork paragraphs, `packages/agent/benchmark/session/README.md` if dataset wording changes. Historical WP docs and released changelogs untouched. Format/storage versions unchanged; no migration.
+### 1.5 coding-agent 状态记录
 
-## 4. Implementation slices
+/fork、/clone、--fork 仍完全使用旧 SessionManager，未迁移到本包。未来采用 SessionRepo 时的映射为：
 
-### Slice A — contract and classifier (core, Memory reference)
+~~~text
+/fork  -> { scope: "branch", branch: "main", entryId, position: "before" }
+/clone -> { scope: "branch", branch: "main" }
+/--fork -> { scope: "tree" }
+~~~
 
-Files: `session/types.ts`, new `session/fork-policy.ts`, `session/fork.ts` (rewritten or deleted), `session/values.ts` (only if new helpers are needed), `session/index.ts`, `session/memory.ts`, `session/in-memory-storage-state.ts`, conformance `testing/conformance/session-repo.ts`, `test/harness/memory-conformance.test.ts`, `test/harness/memory-session-repo.test.ts`.
+## 2. 当前源码的问题
 
-1. Replace `ForkOptions`; implement validation and the classifier/driver.
-2. Rewrite Memory fork as direct destination construction at a commit-queue boundary.
-3. Rewrite the shared fork conformance for the new contract (§5) and pass it on Memory.
+- ForkOptions 默认 branch scope 并硬编码 source/destination main；
+- 没有检查 entryId 是否属于命名 Branch 的 tip ancestry；
+- 三个后端都物化完整 source；
+- createForkSnapshot 重新分配 scalar seq，并用 max entry seq + 1 计算 nextSeq；
+- closed JSONL fork 可能因 open() 的尾部修复而修改 source；
+- lists 从未复制，tree scope 没有应用值策略；
+- namespace fork 规则散落在多个模块，新增 pi.* namespace 不会强制声明策略；
+- entriesComplete 只用于让 SQLite 跳过其他 Branch 的 tip 校验。
 
-### Slice B — JSONL streaming
+## 3. 必须达到的结果
 
-Files: `session/jsonl/storage.ts`, `session/jsonl/repo.ts`, `session/jsonl/types.ts`, streaming reader support in the `FileSystem` capability (`harness/types.ts`, `harness/env/*`) if required, `test/harness/jsonl-session-repo.test.ts`, `jsonl-session-repo-conformance.test.ts`, `jsonl-storage.test.ts`, `jsonl-v3-migration.test.ts`.
+1. 所有 ForkOptions 校验路径符合 §1.1，拒绝时不创建目标 artifact、不留下 rows、不泄漏 reservation ID；
+2. 一个核心 classifier 由三后端共用；未知保留 namespace 只有在有当前存活状态时才拒绝，并保持后端一致；
+3. 三后端都使用 §1.3 的流式过程，删除 snapshot fork plumbing；
+4. 所有复制 seq、改写 tip/idle state seq 和 nextSeq high-water mark 保持不变；
+5. JSONL fork 从不修改 source，包括尾部损坏和 legacy-v3；
+6. 同步更新 harness、values、roadmap、sqlite-node README 和必要 benchmark 文档，历史 WP 文档与已发布 changelog 不改。
 
-1. Read-only fixed-prefix source capture with in-memory torn-tail discard; the same capture at the source `commitQueue` boundary for open sources; no source writes on any fork path.
-2. Two-pass disk-backed current-state fold and emission for both scopes; branch ancestry membership through the disk index; in-place transformed built-ins; atomic destination publish.
-3. Open-v3 fork rejection and the closed-v3 disk-backed parser/normalizer path; update v3 fork tests per §5.
+## 4. 实现切片
 
+### Slice A：契约与 classifier，核心/Memory
 
-### Slice C — SQLite streaming
+修改 session/types.ts、session/fork-policy.ts、session/fork.ts、session/values.ts（如需）、session/index.ts、Memory、conformance 与 Memory 测试。替换 ForkOptions，实现校验和 classifier，直接在 commitQueue 边界构造 Memory 目标，并更新共享 conformance。
 
-Files: `sqlite/repo.ts`, `sqlite/storage.ts`, `sqlite/session/values.ts`, `sqlite/session/entries.ts`, `sqlite/session/branch-entries.ts`, `sqlite/types.ts`, `test/repo.test.ts`, `test/repo-conformance.test.ts`.
+### Slice B：JSONL 流式 fork
 
-1. Replace `SqliteStorage.snapshot()`/array snapshot helpers with the independent-reader-plus-boundary-callback design and iterator transfer into the temporary staging database, then stage-to-destination publication with `finally` cleanup.
-2. Branch ancestry/membership/labels through the branch index; classifier-matching SQL prefilters.
-3. Preserve WP07 identity, reservation, no-create, and close coverage; both layouts.
+修改 JSONL repo/storage/types、必要的 FileSystem streaming capability 和相关测试。实现固定前缀读取、磁盘状态折叠、branch ancestry 索引、原子目标发布、v3 open 拒绝和 closed parser。
 
-### Slice D — benchmarks and documentation
+### Slice C：SQLite 流式 fork
 
-Files: `testing/benchmark/session-repo.ts`, both `session-repo.bench.ts` files, `benchmark/session/README.md`, `harness.md`, `values.md`, `post-wp05-roadmap.md`, sqlite-node `README.md`, changelogs only under normal branch rules.
+修改 sqlite repo/storage/session values/entries/branch-entries/types 和测试。使用独立 reader、边界 callback、临时 staging database、索引 ancestry 与 classifier SQL prefilter，保持 WP07 两种布局和生命周期行为。
 
-Update fork option literals, add large-source fork benchmarks (tree and branch), and land the §3.6 documentation set.
+### Slice D：benchmark 与文档
 
-## 5. Required tests
+更新 ForkOptions literal，增加大源 tree/branch fork benchmark，并同步 harness、values、roadmap、sqlite README 和 benchmark 文档。
 
-### Contract and validation
+## 5. 必需测试
 
-- branch scope rejects: unknown branch name; data-only Branch (tip only); partial config/state pair (corruption); `entryId` not on the named Branch's tip ancestry (present elsewhere in the tree); `entryId` unknown; `entryId` with a `null` tip. Each rejection leaves no destination artifact and releases its reserved id.
-- branch scope accepts: omitted `entryId` (tip), explicit tip, mid-ancestry entry, `position: "before"` at a mid entry and at the root entry (`null` destination tip), `null` source tip with no `entryId`.
-- destination shape: exactly one Branch, same name, copied config, fresh idle lane state, no other lane values, `parentSessionId` set.
-- tree scope: unreachable entries copied; every tip copied; configured lanes get config plus fresh idle state; data-only Branches stay data-only; partial pairs fault.
-- both scopes: session name copied; labels only for copied entries (branch fork excludes labels of non-ancestry entries); `pi.result`, `pi.op.*`, `pi.pending.*` (pending entries, tool checkpoints, assistant frame lists), and usage rows absent; exact stats expectation — a fork copying N message entries reports `getStats()` = `{ messageCount: N, usage: all-zero }`, matching current conformance; the ledger-completeness invariant ("a fork's ledger starts at zero") retained.
+### 契约与校验
 
-### Application values and lists
+覆盖 unknown branch、data-only Branch、部分 config/state、错误 entryId、null tip；覆盖省略 entryId、tip、中间祖先、before 根和中间 entry、null source tip。每次拒绝都验证没有目标 artifact 且 reservation 已释放。
 
-- tree fork copies every non-`pi.*` scalar and every surviving list element with original seqs; list cursors from the source page identically in the destination; a list deleted-then-reappended in the source reproduces only survivors.
-- branch fork copies no application values/lists (pin the §1.1 scalar and list traces as regression cases: post-fork-point overwrite and delete-destroyed elements must not resurface under any implementation).
-- current surviving state in an unknown reserved namespace (exact `pi` or an undeclared `pi.*` scalar or surviving list element) fails the fork on every backend; the same namespace **set then deleted** before the fork fails no backend — including JSONL, where the dead history remains as physical lines and the disk fold must classify it as absent. Construct both cases via raw committed writes.
+验证目标只包含规定的 Branch、config、新 idle lane state 和 parentSessionId；tree scope 复制不可达 entry、每个 tip、配置 lane 和 data-only Branch；部分状态组合都报 corruption。
 
-### Sequence preservation
+验证两种 scope 都复制 session name，label 只随 copied entry 复制；pi.result、pi.op.*、pi.pending.*、usage 和活动状态都缺失；messageCount 与复制的 message entry 数一致，ledger 从零开始。
 
-- copied entries, values, and list elements keep source seqs; rewritten branch tips and fresh idle lane states occupy the seqs of the source's current corresponding rows; destination `nextSeq` equals the source high-water mark and the first post-fork commit allocates above it on every backend (JSONL header `nextSeq`, SQLite `next_seq`).
-- JSONL derives the high-water mark as `max(header.nextSeq when present, highest complete captured write seq + 1)`; a torn incomplete final write does not advance it.
+### 应用值与列表
 
-### Bounded memory and source non-mutation
+tree fork 复制所有非 pi.* 当前 scalar 和存活 list element，保留 seq 与 cursor；delete 后再 append 只复制幸存者。branch fork 不复制任何应用值/列表，并以覆盖和整表删除回归用例证明 cutoff 不会错误恢复历史。
 
-- instrumented source readers (test decorators/spies) assert fork paths never call `snapshotEntriesAndValues`, `captureForkSource`, `readAllScalarValueRows`, `readAllEntryRows`, whole-file `readTextFile`, or source-sized `.all()` arrays on entries/values/lists — bounded iterator steps and staging-database operations are permitted; deterministic large fixtures (extend the existing benchmark dataset generators) exercise tree and branch forks over multi-thousand-entry sources.
-- SQLite staging databases are removed on success and failure; a failed fork leaves neither a stage file nor destination rows.
-- JSONL: fork of a closed torn-tail source succeeds, the destination excludes the torn transaction wholly, and the source file bytes are unchanged (byte-compare before/after); fork of a legacy v3 source leaves the source file unchanged; no `.tmp` appears beside the source; temporary ancestry index files are removed on success and failure.
-- JSONL fixed-prefix capture: a source append completed after capture is wholly absent from the fork.
-- JSONL destination content: the destination file contains only current selected scalar rows and surviving list elements in original seq order — no delete records, superseded sets, or dead application history; the rewritten tip and fresh idle lane state sit at the source current rows' seqs.
-- legacy v3: forking an **open** v3 source rejects with the clear pre-upgrade error; after one normal non-empty commit upgrades it to format 4, a fork succeeds and preserves the persisted ids; a **closed** v3 tree fork succeeds through the disk-backed parser (instrumented: no whole-state in-memory normalization on the fork path) and leaves the source byte-identical; a closed v3 branch fork with omitted `entryId` succeeds when a complete configured lane is reconstructed, a caller-supplied id from an earlier open rejects, and a data-only reconstructed main rejects.
+未知保留 namespace 有当前存活值时三后端都拒绝；set 后 delete 的历史只存在物理日志但不影响 fork。
 
-### Coordination and ordering
+### 序号
 
-- Memory open-source forks keep the queue-boundary conformance case: a commit admitted before the fork appears wholly; one admitted after does not.
-- JSONL open-source forks capture the fixed prefix at the `commitQueue` boundary: a commit admitted before the boundary appears wholly; a source append completed after boundary capture proceeds while the fork is still streaming and is wholly absent from that fork.
-- SQLite same-repo: the independent reader opens first, the boundary callback on the source `commitQueue` establishes its snapshot and releases the queue, and a subsequent source commit on the writer connection **completes while the reader is still streaming into the stage** and is wholly absent from that fork; a later fork includes it wholly. Assert this in **both** per-file and shared-container layouts (satisfiable in shared containers because stage writes target another file), plus the WP07 live external-worker case unchanged.
-- destination-reservation races (create vs fork on one id, both orders) unchanged.
+entry、value、list element 保留 seq；改写 tip 和新 idle lane state 使用源当前 row 的 seq；目标 nextSeq 等于源 high-water mark，首个新提交从其上方分配。JSONL 的 incomplete tail 不推进 high-water mark。
 
-### Backend equivalence
+### 有界内存与 source 不变更
 
-- one shared conformance source (entries, unreachable entries, multiple lanes, data-only Branch, labels, app scalars/lists with deletes, open operation with pending/frame/checkpoint state, usage rows) forks to identical logical destination state on Memory, JSONL, and SQLite for both scopes.
+使用 instrumented reader 证明没有调用无界 snapshot/readAll/readTextFile/.all；大 fixture 覆盖数千 entry 的 tree 与 branch fork。SQLite staging 成功/失败都清理，失败不留目标 rows。
 
-## 6. Validation and review
+JSONL closed torn-tail fork 丢弃整个不完整事务且 source 字节完全不变；v3 fork 不产生 source 旁的 .tmp；固定前缀捕获后发生的 append 完全不进入 fork；目标只含当前 selected rows，无 delete、旧 set 或死亡历史。
 
-After each slice: `npm run check`, then the modified focused tests via the repository Vitest binary from the owning package; `./test.sh` before final review. Grep guards: no remaining `createForkSnapshot|captureForkSource|ForkSourceSnapshot|entriesComplete` outside historical docs and this handoff; no **production fork source path** referencing `"main"` as a literal (this document and the recorded coding-agent mapping in §1.5 intentionally mention main).
+验证 open v3 在升级前明确拒绝；正常非空 commit 升级后 fork 成功；closed v3 使用磁盘 parser；旧进程内 entryId 在重新解析时拒绝；data-only reconstructed lane 始终拒绝。
 
-Review checkpoints (delegated reviews use provider `anthropic`, model `claude-fable-5`):
+### 协调与顺序
 
-1. After Slice A: contract, classifier closure, conformance shape.
-2. After Slice C: same-repo ordering, reader independence, bounded-memory evidence.
-3. Final review of source, tests, docs, and exclusions.
+Memory、JSONL、SQLite open-source fork 都验证 commitQueue 边界：边界前提交完整进入，边界后提交完整排除；SQLite 在两种布局中都验证 source writer 可以在 staging streaming 期间完成后续提交。reservation race 保持 WP07 行为。
 
-## 7. Exclusions
+### 后端等价
 
-Do not include:
+使用同一份包含 entry、不可达 entry、多 lane、data-only Branch、label、应用 scalar/list 删除、open operation、pending/frame/checkpoint、usage 的 fixture，在三后端和两种 scope 上比较完全相同的逻辑目标状态。
 
-- compatibility aliases, a default scope, or implicit `main`;
-- any `seq <= tip` cutoff or other historical-state reconstruction;
-- a fork-policy registry, plugin hook, or DSL; per-address application opt-ins;
-- copying usage rows, `pi.result`, or any open-operation state under any option;
-- coding-agent `/fork`, `/clone`, `--fork`, or RPC migration;
-- storage-version bumps, migrations, or format changes (formats stay WIP-in-place);
-- J1 snapshot compaction (the streaming reader may be built shareable, nothing more);
-- SQLite branch-segment redesign or the uncompacted-divergence fix;
-- `SessionRepo` interface changes beyond `ForkOptions` (repository `close()` belongs to the lifecycle package);
-- precise-rewrite tooling; search; edits to WP00–WP07 documents or released changelog sections.
+## 6. 校验与评审
 
-If implementation requires an excluded item, stop and revise the handoff.
+每个 slice 后运行 npm run check 和对应 package 的 focused tests，最终运行 ./test.sh。检查 createForkSnapshot、captureForkSource、ForkSourceSnapshot、entriesComplete 不再出现在生产代码中；生产 fork source path 不得硬编码 main，文档中的 coding-agent 映射除外。
 
-## 8. Exit condition
+评审节点：Slice A 检查契约、classifier、conformance；Slice C 检查同仓库顺序、reader 独立性和有界内存；最后审查源码、测试、文档和排除项。
 
-WP08 is complete when:
+## 7. 排除项
 
-- `ForkOptions` is exactly the §1.1 union with the stated validation, on all three backends;
-- branch forks require a complete configured source AgentLane and enforce ancestry membership; tree forks copy the complete immutable tree, every tip, configured and data-only Branches;
-- tree forks carry all current application values and surviving list elements with original seqs; branch forks carry none;
-- one closed core classifier owns every namespace disposition; unknown reserved namespaces (exact `pi` or undeclared `pi.*`) fail forks exactly when current surviving state exists, equivalently on all backends;
-- all supported fork paths — including closed legacy v3 sources — are streaming and bounded in auxiliary memory per §1.3, proven by instrumented-reader tests over large fixtures; forking an open legacy-v3 source is explicitly unsupported (clear rejection) until an ordinary commit upgrades it, not handled by an in-memory exception;
-- JSONL forks never mutate their source, including torn-tail and legacy v3 sources, and JSONL destinations contain only current selected rows in original seq order;
-- SQLite forks stage through a temporary on-disk database (source reader → stage while open, stage → one destination `BEGIN IMMEDIATE` after reader close, stage deleted in `finally`), with the independent-reader boundary design and concurrent later writer commits proven in both layouts, preserving all WP07 behavior;
-- copied seqs and `nextSeq` high-water marks are preserved and backends produce identical logical destinations;
-- shared conformance, focused backend tests, benchmarks, `npm run check`, and `./test.sh` pass;
-- normative docs and the roadmap reflect the new contract with historical documents untouched;
-- final Fable review reports no blocker.
+不包括兼容别名、默认 scope、隐式 main、seq cutoff、fork-policy registry/plugin/DSL、usage/pi.result/活动状态复制、coding-agent fork/clone/RPC 迁移、storage/format version 变更、J1 compaction、SQLite branch segment 重设计、SessionRepo 其他接口变化、precise-rewrite 工具、search，以及 WP00–WP07 和已发布 changelog 修改。
+
+若实现需要任何排除项，应停止并重新修订 handoff。
+
+## 8. 完成条件
+
+WP08 完成时，三后端的 ForkOptions、branch/tree 校验、classifier、seq/nextSeq、应用值/列表策略和目标逻辑状态完全符合本文件；所有 fork path（含 closed v3）都使用有界流式复制且 source 不变；SQLite 使用临时磁盘 staging；共享 conformance、focused tests、benchmark、npm run check、./test.sh 和最终 Fable review 全部通过；规范文档和 roadmap 已同步，历史文档未改。

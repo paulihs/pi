@@ -1,29 +1,29 @@
-# WP00 — Runtime1 removal
+# WP00 — 移除 Runtime1
 
-## Status
+## 状态
 
-Complete. No tag. Runtime2 is the sole public implementation. Do not release while its execution path is incomplete.
+已完成。无标签。Runtime2 是唯一的公开实现。在其执行路径尚未完成前不要发布。
 
-## Goal
+## 目标
 
-Make runtime2 the sole public harness implementation, delete runtime1 and its obsolete tests, then stop before adding runtime2 behavior.
+让 Runtime2 成为唯一公开的 Harness 实现，删除 Runtime1 及其过时测试，然后在添加 Runtime2 行为之前停止。
 
-## Prerequisites
+## 前置条件
 
-- The approved acceptance/hook redesign and durability handoffs are present in `harness.md`, `values.md`, `assistant-durability.md`, and `tool-durability.md`.
-- Existing tests are evidence, not authority.
+- 已批准的 acceptance/hook 重设计和持久性交接已存在于 `harness.md`、`values.md`、`assistant-durability.md` 和 `tool-durability.md` 中。
+- 现有测试是证据，不是权威。
 
-## Work, in order
+## 工作顺序
 
-1. **Reconcile the contract.** Fold the approved acceptance/hook redesign into `harness.md`, including durable `starting`, atomic hook-free acceptance, driver-owned `before_run`, `before_drive`, request-local system-prompt transformation, trusted restore, and removal of process-origin activation semantics. Audit §§0.4, 1.2, 3.1–3.6, 4.1–4.2, 4.5, 5.1–5.2, 5.5–5.6, and Parts 8–9; remove every stale `BeforeResumePrepared`, `before_resume`, `resumeData`, `systemPromptOverride`, stable-ID routing, reservation, and `fresh | continue | resume` activation reference. Delete obsolete runtime planning documents once `harness.md` and linked handoffs own the active contract.
-2. **Harvest before deletion.** Inspect `agent-harness-runtime.test.ts`, `agent-harness-r2/r3/r4.test.ts`, and old `restore.test.ts`. Preserve unique scenarios in the detailed future rows or a temporary categorized inventory; explicitly discard old reservation, `before_resume`, `resumeData`, persisted hook prompt override, semantic restore audit, and pre-`outcome_ready` tool-crash behavior.
-3. **Remove runtime1-only public members.** Delete `before_resume`, `BeforeResumePrepared`, `resumeData`, `systemPromptOverride`, and stable hook-ID routing. Add the approved `before_drive` and `transform_context` shapes. Update telemetry schema source and regenerate its document. Do not implement `starting` or acceptance behavior here.
-4. **Switch the factory.** Add `packages/agent/src/harness/runtime2/index.ts`, point `agent-harness.ts` at it, and add a constructor-selection regression. Verify the experimental coding-agent worker still creates the harness, subscribes to events, and closes it.
-5. **Delete runtime1 source and tests** listed below.
-6. **Update `[Unreleased]` on `main` or a pull-request branch** for the public breaking removals and temporarily incomplete factory. Repository policy forbids changelog edits on `dev`, so WP00 records but does not perform that release-facing step here.
-7. Run the retained tests and checks. Fix every failure; do not restore compatibility shims.
+1. **统一契约。** 将已批准的 acceptance/hook 重设计并入 `harness.md`，包括持久化的 `starting`、无 hook 的原子 acceptance、driver 所有的 `before_run`、`before_drive`、请求本地的 system-prompt 转换、可信恢复，以及移除进程来源的激活语义。审计 §§0.4、1.2、3.1–3.6、4.1–4.2、4.5、5.1–5.2、5.5–5.6 和第 8–9 部分；删除所有过时的 `BeforeResumePrepared`、`before_resume`、`resumeData`、`systemPromptOverride`、稳定 ID 路由、预留，以及 `fresh | continue | resume` 激活引用。当 `harness.md` 和其关联交接文档拥有活动契约后，删除过时的 runtime 规划文档。
+2. **删除前先收集场景。** 检查 `agent-harness-runtime.test.ts`、`agent-harness-r2/r3/r4.test.ts` 和旧的 `restore.test.ts`。在详细的未来条目或临时分类清单中保留独有场景；明确丢弃旧的 reservation、`before_resume`、`resumeData`、持久化 hook prompt override、语义恢复审计，以及 `outcome_ready` 之前的工具崩溃行为。
+3. **移除仅 Runtime1 的公开成员。** 删除 `before_resume`、`BeforeResumePrepared`、`resumeData`、`systemPromptOverride` 和稳定 hook-ID 路由。添加已批准的 `before_drive` 和 `transform_context` 形态。更新 telemetry schema 源文件并重新生成其文档。这里不要实现 `starting` 或 acceptance 行为。
+4. **切换工厂。** 添加 `packages/agent/src/harness/runtime2/index.ts`，让 `agent-harness.ts` 指向它，并添加构造函数选择回归测试。验证 experimental coding-agent worker 仍能创建 Harness、订阅事件并关闭它。
+5. **删除下面列出的 Runtime1 源码和测试。**
+6. **在 `main` 或 pull-request 分支更新 `[Unreleased]`**，记录公开破坏性移除和暂时未完成的工厂。仓库策略禁止在 `dev` 上修改 changelog，因此 WP00 只记录这一步，不在此处执行面向发布的修改。
+7. 运行保留的测试和检查。修复每一个失败；不要恢复兼容性垫片。
 
-## Delete
+## 删除
 
 ```text
 packages/agent/src/harness/runtime/**
@@ -39,45 +39,45 @@ packages/agent/test/harness/scratch/r3.ts
 packages/agent/test/harness/scratch/r4.ts
 ```
 
-## Retain
+## 保留
 
-- all `test/harness/runtime2/**` tests;
-- Session, Branch, storage, repository, backend-conformance, and instrumentation tests;
-- execution assistant/tool/primitives tests;
-- config, hooks, events, telemetry, compaction, and branch-summary code/tests;
-- `types.test.ts`, updated for the reduced public contract;
-- `packages/agent/src/agent-loop.ts` unchanged.
+- 所有 `test/harness/runtime2/**` 测试；
+- Session、Branch、存储、repository、backend-conformance 和 instrumentation 测试；
+- 执行 assistant/tool/primitives 测试；
+- config、hooks、events、telemetry、compaction 和 branch-summary 代码/测试；
+- 根据精简后的公开契约更新 `types.test.ts`；
+- `packages/agent/src/agent-loop.ts` 保持不变。
 
-Do not parameterize obsolete runtime1 suites against runtime2 and do not keep a runtime1 smoke suite.
+不要将过时的 Runtime1 测试套件参数化到 Runtime2，也不要保留 Runtime1 smoke 套件。
 
-## Acceptance
+## 验收
 
-- No source import references `harness/runtime/*`.
-- Public `AgentHarness.create()` selects runtime2.
-- Runtime2 creation, events, inspection, close, and fault tests pass.
-- These coding-agent tests pass:
+- 没有源文件导入 `harness/runtime/*`。
+- 公开的 `AgentHarness.create()` 选择 Runtime2。
+- Runtime2 的创建、事件、检查、关闭和故障测试通过。
+- 以下 coding-agent 测试通过：
   - `experimental-remote-runtime.test.ts`
-  - `experimental-session-worker-manager.test.ts` (the upstream replacement for the removed `experimental-session-worker.test.ts`)
+  - `experimental-session-worker-manager.test.ts`（替代已移除的 `experimental-session-worker.test.ts` 的上游测试）
   - `experimental-session-worker-lifecycle.test.ts`
-- Every modified test passes individually.
-- Agent and root TypeScript pass.
-- `git diff --check` and `npm run check` pass.
+- 每个修改过的测试都单独通过。
+- Agent 和根目录 TypeScript 检查通过。
+- `git diff --check` 和 `npm run check` 通过。
 
-## Outcome
+## 结果
 
-- The accepted hook/drive contract is normative in `harness.md`; stale acceptance/resume contracts are absent.
-- Runtime1 source, validating restore, obsolete suites, and R1–R4 scratch scenarios are deleted.
-- `AgentHarness.create()` resolves through `runtime2/index.ts`; a constructor-selection regression proves it.
-- The scenario harvest added missing tool-close, identity-preflight, recovery-ordering, turn-bracket, and telemetry cases to future rows.
-- Upstream added two real remote prompt tests after this handoff was drafted. They remain present but skipped with an R2 re-enable requirement because runtime2 execution is intentionally incomplete. Worker creation, attachment, lifecycle, operation correlation, and close coverage passes.
+- 已接受的 hook/drive 契约在 `harness.md` 中是规范性的；过时的 acceptance/resume 契约已不存在。
+- Runtime1 源码、校验式恢复、过时套件以及 R1–R4 scratch 场景已删除。
+- `AgentHarness.create()` 通过 `runtime2/index.ts` 解析；构造函数选择回归测试对此进行了证明。
+- 场景收集为未来条目补充了缺失的 tool-close、identity-preflight、recovery-ordering、turn-bracket 和 telemetry 场景。
+- 本交接文档起草后，上游增加了两个真实的远程 prompt 测试。它们仍然存在但被跳过，并要求 R2 重新启用，因为 Runtime2 执行尚未完成。worker 创建、附加、生命周期、操作关联和关闭覆盖已通过。
 
-## Non-goals
+## 非目标
 
-- No bound-value/list implementation.
-- No implementation of `starting` or atomic acceptance.
-- No drive owner, provider, retry, deferred, or tool execution.
-- No runtime1 parity work, compatibility layer, archaeology tag, or release.
+- 不实现有界 value/list。
+- 不实现 `starting` 或原子 acceptance。
+- 不实现 drive owner、provider、retry、deferred 或 tool 执行。
+- 不做 Runtime1 parity 工作、兼容层、考古标签或发布。
 
-## Stop condition
+## 停止条件
 
-Stop once runtime1 is absent, runtime2 is the public factory, retained coverage is green, and all checks pass. Report the deletion and harvested scenarios; do not begin another work package.
+Runtime1 已不存在、Runtime2 是公开工厂、保留的覆盖率为绿色且所有检查通过后停止。报告删除内容和收集到的场景；不要开始另一个工作包。

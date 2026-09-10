@@ -1,26 +1,21 @@
-# 01-delta: known defects and measured findings
+# 01-delta：已知缺陷和测量结果
 
-Everything here was found **after** `delta.md` and the prototype implementation beside it were written. None of it is applied to the code in this directory. Production now lives in `packages/chord/src/delta/index.ts`: flush-time dirty tracking resolves D1, and production remeasurement closes D2 without a new API. See [`append-decision.md`](append-decision.md). Each item below remains the original problem, evidence, and candidate-fix record.
+这里记录的所有内容都是在写完 `delta.md` 及其旁边的原型实现**之后**发现的。这里的代码尚未应用任何一项。生产代码现在位于 `packages/chord/src/delta/index.ts`：刷新时的脏跟踪解决了 D1，生产环境重新测量后无需新 API 即关闭了 D2。见 [`append-decision.md`](append-decision.md)。下面每一项仍保留原始的问题、证据和候选修复记录。
 
-Every number was measured with **`node --experimental-strip-types`**, not `tsx`.
-That matters: tsx transpiles through esbuild and inflated the same benchmark by
-**2.6x** (183 µs vs 63 µs per write). Do not benchmark this module through a
-transpiler.
+所有数字均使用 **`node --experimental-strip-types`** 测量，而不是 `tsx`。
+这很重要：tsx 通过 esbuild 转译，使同一基准测试膨胀了 **2.6 倍**（每次写入 183 µs 对 63 µs）。不要通过转译器测量该模块。
 
 ---
 
-## D1. Interleaved paths defeat coalescing (correctness-adjacent, unbounded memory)
+## D1. 交错路径会破坏合并（接近正确性问题，内存无上限）
 
-**Severity: high.** This is the one to fix first.
+**严重程度：高。** 这是首先应该修复的问题。
 
-### Problem
+### 问题
 
-`flush()` coalesces only **adjacent** ops. A producer that alternates between two
-paths therefore never coalesces anything, and the ops array grows with the number
-of writes rather than with the size of the value.
+`flush()` 只会合并**相邻**操作。因此，在两条路径之间交替写入的生产者完全无法合并，操作数组会随着写入次数增长，而不是随着值的大小增长。
 
-This is not hypothetical. It is exactly what bash does: it updates the output text
-and a byte counter on every chunk.
+这不是假设场景。bash 的行为正是如此：每个 chunk 都更新输出文本和字节计数器。
 
 ```ts
 const next = t.state.content[0].text + chunk;
@@ -28,80 +23,58 @@ t.state.content[0].text = next.length > CAP ? next.slice(next.length - CAP) : ne
 t.state.truncation.totalBytes += chunk.length;    // <- the other path
 ```
 
-### Evidence
+### 证据
 
-50 KB window, 200-byte chunks, no flush in between:
+50 KB 窗口、200 字节 chunk，中间不刷新：
 
-| held-back writes | ops | bytes |
+| 暂存写入数 | 操作数 | 字节数 |
 | --- | --- | --- |
 | 1 | 3 | 0.3 KB |
 | 100 | 201 | 26 KB |
 | **1000** | **2001** | **264 KB** |
 
-Without interleaving the same workload gives 1 op and 51 KB. The window is
-bounded at 50 KB; the ops describing it are not.
+不交错时，同一工作负载只产生 1 个操作和 51 KB。窗口被限制在 50 KB，但描述它的操作没有上限。
 
-### Why it matters beyond memory
+### 这为什么不只是内存问题
 
-Any design where the sink **holds back** — rate limiting, backpressure, a slow
-consumer — depends on held-back writes costing nothing. They currently cost
-everything. See `../../04-tool-output/rate-limiting.md`.
+任何 sink 会**暂存**的设计——限速、背压、慢消费者——都依赖于暂存写入不产生额外成本。当前它们会产生全部成本。见 `../../04-tool-output/rate-limiting.md`。
 
-### Candidate fix
+### 候选修复
 
-Fold at **record** time, keyed by path rather than by adjacency: one slot per
-path holding at most two ops (`[s]`, `[d]`, `[t]`, `[a]`, or `[t, a]`), emitted in
-first-touch order.
+在**记录时**按路径而不是按相邻关系折叠：每条路径占一个槽位，最多保留两个操作（`[s]`、`[d]`、`[t]`、`[a]` 或 `[t, a]`），并按首次触碰顺序发出。
 
-A prototype reached **2 ops / 51 KB** on the same workload. It is not included
-here because it was not verified to the standard the rest of this unit meets.
+同一工作负载的原型结果为 **2 个操作 / 51 KB**。这里不包含该原型，因为它尚未达到本单元其他部分采用的验证标准。
 
-**Four folding rules, each a specific claim about the vocabulary:**
+**四条折叠规则，每条都是对词汇表的具体断言：**
 
-1. A later `s` supersedes an earlier `s` on the same path — but **not** an earlier
-   `d`, which must survive or the key changes position on reinsertion (§5.1).
-2. Consecutive `a` merge. Once the merged append is **strictly longer** than the
-   value, the window has been sliding and the append is the more expensive
-   spelling, so collapse to `s`. Strictly: while a string is still *growing*
-   toward its cap the append equals the value, and collapsing there would resend
-   the whole string every batch.
-3. `t` and `a` on one path **commute** — the truncate drops from the front, the
-   append adds to the end — so a rolling window's `t,a,t,a,...` folds to one of
-   each. Without this, pairwise merging never fires at all.
-4. `t` or `a` following a pending `s` changes nothing: the `s` already means "this
-   path becomes its current value".
+1. 后续同一路径的 `s` 会覆盖之前的 `s`——但**不会**覆盖之前的 `d`，因为删除操作必须保留，否则键在重新插入时会改变位置（§5.1）。
+2. 连续的 `a` 会合并。当合并后的追加内容**严格长于**值时，窗口已经开始滑动，追加是更昂贵的表达，因此折叠为 `s`。严格地说，当字符串仍在增长并接近上限时，追加内容等于该值；此时折叠会导致每个批次都重新发送整个字符串。
+3. 同一路径上的 `t` 与 `a` **可交换**——截断从前端删除，追加从末端添加——因此滚动窗口的 `t,a,t,a,...` 会折叠为各一个。没有这一点，成对合并根本不会触发。
+4. 待处理的 `s` 之后再出现 `t` 或 `a` 不会改变任何东西：`s` 已经表示“该路径变成当前值”。
 
-**The trap that prototype hit.** Slots emit in first-touch order, which loses the
-fact that a child write happened *before* a later parent write:
+**原型踩到的陷阱。** 槽位按首次触碰顺序发出，这会丢失“子节点写入发生在后续父节点写入之前”这一事实：
 
 ```
-script  : a={x:1}; a.b=99; a={c:2}
-producer: {"a":{"c":2}}
-replica : {"a":{"c":2,"b":99}}      <- WRONG
+脚本    : a={x:1}; a.b=99; a={c:2}
+生产者  : {"a":{"c":2}}
+副本    : {"a":{"c":2,"b":99}}      <- 错误
 ```
 
-A set or delete must invalidate every pending slot **below** its path, at record
-time. The existing `verify-dead` style test passed 1190 sequences while this was
-broken, because its generator only nested one level. Any test for this must
-generate genuinely nested paths with parent overwrites interleaved between child
-writes.
+在记录时，set 或 delete 必须使其路径下方的每个待处理槽位失效。现有的 `verify-dead` 风格测试在该问题存在时仍通过了 1190 个序列，因为其生成器只嵌套了一层。相关测试必须生成真正的嵌套路径，并在子节点写入之间交错执行父节点覆盖。
 
 ---
 
-## D2. `overlap()` was 94.5% of prototype tracker time — closed
+## D2. `overlap()` 占原型跟踪器耗时的 94.5%——已关闭
 
-**Historical severity: high. Production decision:** do not add an explicit append/truncate API. The prototype profile was dominated by a slow `startsWith` path; production uses a flattened-slice comparison and measured 17.8–18.7 µs per 200 KB assistant append flush and 2.43–2.46 µs per 50 KB rolling-window flush locally. See [`append-decision.md`](append-decision.md). The original evidence follows.
+**历史严重程度：高。生产决策：** 不添加显式追加/截断 API。原型性能分析被缓慢的 `startsWith` 路径主导；生产实现使用展平后的 slice 比较，本地测得 200 KB assistant 追加刷新为 17.8–18.7 µs，50 KB 滚动窗口刷新为 2.43–2.46 µs。见 [`append-decision.md`](append-decision.md)。下面保留原始证据。
 
-### Problem
+### 问题
 
-The tracker infers "you appended and evicted" by searching two 50 KB strings.
-Each new value produced by `next.slice(-CAP)` is a V8 `SlicedString` — a lazy
-substring — and `indexOf`/`endsWith` force it to **flatten**, copying 50 KB per
-call.
+跟踪器通过搜索两个 50 KB 字符串来推断“你追加了内容并淘汰了内容”。`next.slice(-CAP)` 产生的每个新值都是 V8 的 `SlicedString`——一种惰性子字符串；`indexOf`/`endsWith` 会迫使它展平，每次调用都复制 50 KB。
 
-### Evidence
+### 证据
 
-CPU profile of a 20 000-write rolling-window loop, node, flush at the end:
+一个 20,000 次写入的滚动窗口循环，Node，末尾刷新，其 CPU profile：
 
 ```
   94.5%  overlap
@@ -112,103 +85,71 @@ CPU profile of a 20 000-write rolling-window loop, node, flush at the end:
    0.0%  fold
 ```
 
-And the flattening is directly observable:
+展平可以直接观察到：
 
-| `overlap()` on a 50 KB window | µs |
+| 在 50 KB 窗口上调用 `overlap()` | µs |
 | --- | --- |
-| the same two strings reused | 37 |
-| **a fresh sliced string each call** | **149** |
+| 重复使用相同的两个字符串 | 37 |
+| **每次调用都使用新切出的字符串** | **149** |
 
-An earlier benchmark reported 29 µs because it reused two already-flattened
-strings 2000 times — a case that never occurs in the real loop. **Do not benchmark
-string operations against a reused fixture.**
+更早的基准测试报告 29 µs，因为它重复使用了两个已经展平的字符串 2000 次——真实循环中不会出现这种情况。**不要在字符串基准测试中重复使用 fixture。**
 
-### Candidate fix
+### 候选修复
 
-Do not infer what the producer already knows. `ToolOutput` performs the windowing,
-so it can emit the ops directly rather than assigning a new string and having the
-tracker search for the difference:
+不要推断生产者已经知道的事实。`ToolOutput` 负责窗口化，因此可以直接发出操作，而不是先赋予新字符串，再让跟踪器搜索差异：
 
 ```ts
 out.append(chunk);       // -> ["t", path, dropped], ["a", path, chunk]
 ```
 
-Two integers — chars appended, chars evicted — describe everything that happened
-between any two observations of a bounded window. A prototype of this shape held
-**exactly the window** in memory under every load, with no ops array, no overlap
-detection and no folding rules at all.
+两个整数——追加的字符数、淘汰的字符数——就能描述两个观察之间有界窗口发生的一切。该形态的原型在每种负载下都只保留**恰好一个窗口**，没有操作数组、重叠检测或折叠规则。
 
-This does **not** remove `overlap`: it stays for the general case where a producer
-assigns a whole new string and the delta genuinely has to be discovered. It
-removes it from the hot path.
+这并不会移除 `overlap`：当生产者赋予一个全新的字符串、确实需要发现 delta 时，通用场景仍会使用它。它只是将 `overlap` 从热路径上移除。
 
-### Do not
+### 不要做
 
-Do not "optimise" `overlap` itself before doing the above. Its algorithm is
-already correct and bounded (`maxOverlapScan`); the cost is string flattening,
-which no probe strategy avoids.
+不要在完成上述工作前“优化” `overlap` 本身。其算法已经正确且有界（`maxOverlapScan`）；成本来自字符串展平，没有任何探测策略可以规避它。
 
 ---
 
-## D3. Nested-path proxy overhead is next, and currently invisible
+## D3. 嵌套路径的代理开销是下一个问题，目前不可见
 
-**Severity: unknown — measure before acting.**
+**严重程度：未知——先测量再行动。**
 
-`overlap` dominates so completely that nothing else shows in a profile. But two
-benchmarks disagree in a way that points at path depth:
+`overlap` 占比压倒性地高，以至于性能分析中看不到其他内容。但两个基准测试出现了指向路径深度的差异：
 
-| | µs per write |
+| | 每次写入的 µs |
 | --- | --- |
-| top-level path (`{ text }`) | 63 |
-| nested path (`{ content: [{ text }] }`) | 244 |
+| 顶层路径（`{ text }`） | 63 |
+| 嵌套路径（`{ content: [{ text }] }`） | 244 |
 
-4x for depth alone. Each nested property access wraps a child proxy and builds a
-cache key by joining the path, so a read of `content[0].text` allocates on every
-access.
+仅深度就带来 4 倍开销。每次嵌套属性访问都会包装子代理，并通过拼接路径构建缓存键，因此读取 `content[0].text` 时每次都会分配内存。
 
-**Re-profile only if production delta cost becomes material.** This may be the next bottleneck or it may be
-nothing; the current numbers cannot distinguish them because `overlap` swamps both.
+**只有当生产环境的 delta 成本变得显著时才重新分析。** 这可能是下一个瓶颈，也可能不是；当前数字无法区分，因为 `overlap` 淹没了两者。
 
 ---
 
-## D4. Things measured and found NOT worth doing
+## D4. 测量后认为不值得做的事项
 
-Recorded so nobody repeats the work. All were under **1.5% combined** in the
-profile above.
+记录下来，避免重复工作。上面的 profile 中它们合计低于 **1.5%**。
 
-**A path trie replacing `JSON.stringify(path)` keys.** Genuinely faster in
-isolation — 6x on the `LaneSnapshot` shape, 93x at 500 distinct paths — because
-stringify cost scales with path depth while a trie walk is one `Map.get` per
-segment. But the whole slot layer is 0.5% of runtime. Build it only if a current production profile says so.
+**用路径 trie 替换 `JSON.stringify(path)` 键。** 单独测量确实更快——在 `LaneSnapshot` 形状上快 6 倍，在 500 条不同路径上快 93 倍——因为 stringify 成本随路径深度增长，而 trie 遍历每段只需一次 `Map.get`。但整个槽位层只占运行时间的 0.5%。只有当前生产 profile 有此指示时才构建它。
 
-**Trie as storage vs trie as index.** If a trie is ever built, it should map path
-to a **position in the ops array**, not hold the ops. Holding them loses first-touch
-ordering and forces a sort at flush to rebuild it. Measured difference: none
-(1.4x / 0.9x / 1.0x). The argument is structural, not performance.
+**Trie 作为存储还是作为索引。** 如果将来构建 trie，它应该把路径映射到操作数组中的**位置**，而不是保存操作。保存操作会丢失首次触碰顺序，并迫使 flush 时排序以重建顺序。测量差异：无（1.4x / 0.9x / 1.0x）。这是结构论证，而非性能论证。
 
-**A `maxDepth` heuristic to skip descendant scanning.** Rejected: the flat map was
-losing on the common case too, so the heuristic would have hidden a real cost
-rather than removed it.
+**用 `maxDepth` 启发式跳过后代扫描。** 拒绝：普通场景下扁平 map 也在输，因此该启发式只会隐藏真实成本，而不是消除它。
 
-**Eager string concatenation in the `a`+`a` merge.** Real (it rebuilds a growing
-string per write) but worth ~5%. Compare lengths and materialise only when
-emitting.
+**在 `a`+`a` 合并中急切拼接字符串。** 影响真实（每次写入都会重建增长中的字符串），但收益约为 5%。比较长度，并只在发出时物化。
 
 ---
 
-## D5. Measurement errors made while producing these numbers
+## D5. 产生这些数字时犯下的测量错误
 
-Listed because each one produced a confident wrong conclusion, and the same traps
-are still there.
+列出这些错误，是因为每一个都曾产生看似有把握的错误结论，而这些陷阱仍然存在。
 
-- **Benchmarking through `tsx`** — inflated everything 2.6x.
-- **Reusing a flattened string** in a string benchmark — hid the real cost 4x.
-- **Repetitive fixtures** (`"x".repeat(n)`) — overlap detection hits its candidate
-  bound and gives up, so the benchmark measures the fallback path, not the real one.
-  Use varied text.
-- **Measuring a cache hit as if it were work** — `Markdown.render()` returns
-  `cachedLines` when text and width are unchanged, so a repeat-the-same-call loop
-  measured 0.065 ms for something that costs 0.86 ms.
-- **Reasoning about complexity while the constant dominated** — twice.
-- **Measuring heap instead of retained size** — a fixture generating 800 x 1 MB
-  strings reported 40 MB of "growth" that was its own garbage.
+- **通过 `tsx` 做基准测试**——使所有结果膨胀 2.6 倍。
+- **在字符串基准测试中重复使用已展平字符串**——将真实成本隐藏了 4 倍。
+- **重复 fixture**（`"x".repeat(n)`）——重叠检测会触达候选上限并放弃，因此基准测试测量的是回退路径，而不是真实路径。使用变化的文本。
+- **把缓存命中当成工作来测量**——`Markdown.render()` 在文本和宽度不变时返回 `cachedLines`，因此重复相同调用的循环测得 0.065 ms，而真实成本为 0.86 ms。
+- **在常数项占主导时讨论复杂度**——两次。
+- **测量堆而不是保留大小**——生成 800 个 1 MB 字符串的 fixture 报告了 40 MB 的“增长”，其实那是它自身的垃圾。

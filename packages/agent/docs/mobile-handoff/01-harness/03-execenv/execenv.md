@@ -1,43 +1,43 @@
-# ExecutionEnv: bounded shell output
+# ExecutionEnv：有界 Shell 输出
 
-**Status:** implemented in production source. The prototype files beside this document are historical evidence; production lives in:
+**状态：已在生产源码中实现。** 本文旁边的原型文件是历史证据；生产代码位于：
 
 - `packages/agent/src/harness/utils/adaptive-publisher.ts`
 - `packages/agent/src/harness/utils/output-capture.ts`
 - `packages/agent/src/harness/env/nodejs.ts`
 - `packages/agent/src/harness/tools/bash.ts`
 
-The generic `ToolOutput` use of the same publisher remains in `04-tool-output`.
+同一发布器在通用 `ToolOutput` 中的使用仍见 `04-tool-output`，目前属于设计工作。
 
-## 1. Problem
+## 1. 问题
 
-The old `Shell.exec()` accumulated complete strings inside `NodeExecutionEnv`:
+旧版 `Shell.exec()` 会在 `NodeExecutionEnv` 中累积完整字符串：
 
 ```ts
 stdout += chunk;
 stderr += chunk;
 ```
 
-Bash truncated only after those strings had already been built. `cat 1gb.txt` therefore materialized a gigabyte in the worker before any tool-level bound could help.
+bash 只有在这些字符串已经构建完成后才截断。于是 `cat 1gb.txt` 会在 worker 中先物化 1 GB 数据，工具层的任何上限都来不及发挥作用。
 
-Spilling also belongs where bytes originate. If execution is remote, a spill on the worker is inaccessible to the model's `read` and `grep` tools, and creating it after transport would first send the complete gigabyte over the connection.
+溢写也应该发生在字节产生的位置。如果执行是远程的，worker 上的溢写文件对模型的 `read` 和 `grep` 工具不可访问；如果在传输后才创建溢写文件，则必须先把完整的 1 GB 通过连接发送出去。
 
-## 2. Boundary
+## 2. 边界
 
-`ExecutionEnv` now owns:
+现在 `ExecutionEnv` 负责：
 
-- a bounded head or tail view;
-- complete byte and line totals;
-- lazy source-local spill after the view first crosses its limits;
-- persistent source-local spill with bounded write-stream backpressure;
-- adaptive publication of the latest bounded state;
-- a forced final publication before settlement.
+- 有界的头部或尾部视图；
+- 完整的字节和行总数；
+- 视图首次超过限制后，延迟创建源端本地溢写文件；
+- 带有界写流背压的持久源端本地溢写；
+- 最新有界状态的自适应发布；
+- 结算前强制进行最终发布。
 
-It does not return or retain separate `stdout` and `stderr` values. Both pipes feed one arrival-ordered model-visible text view, matching bash and `ToolOutput`; preserving stream styling through tail eviction would require a segmented retained state that the Harness does not expose. Text is folded from updates, and `ShellExecResult` contains only exit and truncation/spill metadata.
+它不会返回或保留独立的 `stdout` 和 `stderr` 值。两条管道共同输入一个按到达顺序排列、对模型可见的文本视图，与 bash 和 `ToolOutput` 一致；如果要在尾部淘汰过程中保留流样式，就需要 Harness 没有暴露的分段保留状态。文本由更新折叠而成，`ShellExecResult` 只包含退出以及截断/溢写元数据。
 
-Bash owns only command semantics and its model-visible footer. Its old rolling buffer, spill creation, 100 ms throttle, and full-output accumulation are gone. The existing two-second durable checkpoint request remains temporarily until `ToolOutput` owns durable cadence.
+bash 只负责命令语义和模型可见的页脚。它旧有的滚动缓冲区、溢写创建、100 ms 节流和完整输出累积都已移除。现有的两秒持久检查点请求会暂时保留，直到 `ToolOutput` 接管持久节奏。
 
-## 3. Contract
+## 3. 契约
 
 ```ts
 interface ShellOutputLimits {
@@ -74,17 +74,17 @@ interface ShellExecResult extends ShellOutputMetadata {
 }
 ```
 
-`drop` counts JavaScript string code units, matching `slice()`. Updates are ordered. A consumer applies them with `applyShellOutputUpdate()`.
+`drop` 统计 JavaScript 字符串 code unit，与 `slice()` 一致。更新按顺序排列。消费者使用 `applyShellOutputUpdate()` 应用它们。
 
-A complete replacement establishes the initial state or recovers when no verified overlap exists. An append carries only a growing suffix. A slide drops a prefix and appends the new suffix. Metadata updates move totals or the spill path without resending text.
+完整替换会建立初始状态，或在没有可验证重叠时执行恢复。append 只携带增长的后缀。slide 删除前缀并追加新后缀。metadata 更新会移动总数或溢写路径，而无需重新发送文本。
 
-The compatibility `executeShellWithCapture()` helper still returns one bounded final view. Its `onChunk` callback receives initial, append, and slide text only; metadata and post-turnover replacements are not mislabeled as new bytes.
+兼容性 helper `executeShellWithCapture()` 仍返回一个有界的最终视图。其 `onChunk` 回调只接收初始文本、追加文本和 slide 文本；metadata 以及周转后的替换不会被错误标记为新字节。
 
-## 4. Adaptive publication
+## 4. 自适应发布
 
-`AdaptivePublisher` keeps only the latest dirty state. Intermediate process writes never become a queue of output updates.
+`AdaptivePublisher` 只保留最新的脏状态。中间的进程写入不会变成输出更新队列。
 
-Policy is harness-global rather than per tool:
+策略是 Harness 全局策略，而不是每个工具单独配置：
 
 ```ts
 minIntervalMs = 100;
@@ -92,57 +92,57 @@ targetBytesPerSecond = 100 * 1024;
 nextDelayMs = max(minIntervalMs, encodedUpdateBytes * 1000 / targetBytesPerSecond);
 ```
 
-The first dirty state after idle is immediate. Writes received before the deadline collapse into the latest bounded state. One trailing timer guarantees eventual publication. Finalization bypasses the deadline once, still bounded by the retained cap.
+空闲后的第一个脏状态会立即发布。截止时间前收到的写入会折叠到最新有界状态。一个尾部定时器保证最终发布。终结会绕过一次截止时间，但仍受保留上限限制。
 
-The publisher commits its baseline before invoking the consumer. If a consumer applies an update and then throws, finalization cannot emit the same delta twice. The command fails with `callback_error`.
+发布器在调用消费者前提交其基线。如果消费者应用更新后抛错，终结时也不会再次发出同一个 delta。命令会以 `callback_error` 失败。
 
-### Workload behavior
+### 工作负载行为
 
-| workload | result |
+| 工作负载 | 结果 |
 | --- | --- |
-| Finishes below cap | immediate initial state, small appends, forced final state |
-| Below-cap trickle | isolated writes are immediate; sustained writes are at most 100 ms apart |
-| Full-force output after cap | complete turnovers are cap-sized replacements spaced by their encoded size |
-| Post-cap trickle | small verified `slide` updates remain responsive; the complete window is not resent |
-| Burst then silence | one leading update and one trailing update |
-| Error, timeout, or abort | latest bounded state is forced before the error settles |
+| 在上限内完成 | 立即发布初始状态、小型追加、强制发布最终状态 |
+| 低于上限的涓流 | 独立写入立即发布；持续写入最多每 100 ms 一次 |
+| 超过上限的全速输出 | 完整周转会产生按上限大小限制的替换，间隔由编码大小决定 |
+| 超过上限后的涓流 | 小型且经过验证的 `slide` 更新保持响应；不会重新发送完整窗口 |
+| 突发后静默 | 一个前导更新和一个尾部更新 |
+| 错误、超时或中止 | 错误结算前强制发布最新有界状态 |
 
-At a 50 KB cap and 100 KB/s target, repeated complete turnovers settle near two updates per second. Small post-cap slides still use the 100 ms floor.
+在 50 KB 上限、100 KB/s 目标下，重复的完整周转约稳定在每秒两次更新。超过上限后的较小 slide 仍使用 100 ms 下限。
 
-The rate bound is amortized. An immediate-after-idle update and forced terminal update may each create one cap-bounded burst.
+速率上限是摊销意义上的。空闲后立即更新和强制终端更新可能各自产生一次受上限约束的突发。
 
-## 5. Capture and spill
+## 5. 捕获和溢写
 
-`OutputCapture` trims its decoded line-aware working buffer back to twice the byte cap when it exceeds four times the cap. Tail mode drops old text; head mode preserves the original prefix. This amortizes UTF-8 trimming instead of rescanning the retained window for every process chunk.
+当解码后的、按行感知的工作缓冲区超过上限的四倍时，`OutputCapture` 会将其裁回上限的两倍。尾部模式丢弃旧文本；头部模式保留原始前缀。这样可以摊销 UTF-8 裁剪，而不是对每个进程 chunk 都重新扫描保留窗口。
 
-Spill creation is lazy. Before crossing, the source keeps at most the bounded prefix needed to create a complete archive. On crossing it:
+溢写创建是延迟的。在超过上限之前，源端最多保留创建完整归档所需的有界前缀。超过上限后，它会：
 
-1. pauses stdout and stderr while it creates the file inside the execution environment;
-2. opens one persistent append stream with a bounded 8 MB high-water mark;
-3. writes the preserved raw prefix and subsequent raw chunks in arrival order;
-4. resumes immediately while the writer accepts data;
-5. pauses again only when `write()` reports backpressure, then resumes on `drain`.
+1. 暂停 stdout 和 stderr，在执行环境内创建文件；
+2. 打开一个持久追加流，high-water mark 限制为 8 MB；
+3. 按到达顺序写入保留的原始前缀和后续原始 chunk；
+4. 在写入器接受数据时立即恢复；
+5. 只有当 `write()` 报告背压时才再次暂停，并在 `drain` 后恢复。
 
-This avoids both an unbounded promise chain and one async file-open/append cycle per process chunk. A spill create or stream-write failure kills the child and fails execution rather than publishing lossy success.
+这既避免无界的 promise 链，也避免每个进程 chunk 都执行一次异步文件打开/追加循环。溢写创建或流写入失败会终止子进程并使执行失败，而不是发布丢失数据的成功结果。
 
-The spill path is force-published as metadata when it becomes available. Spill writes are awaited before the final output flush.
+溢写路径一旦可用，就作为 metadata 强制发布。最终输出刷新前会等待溢写写入完成。
 
-Node streams remain raw for spill throughput and exact archival bytes. `OutputCapture` uses one streaming `TextDecoder`, so a read boundary cannot split a code point; invalid display control characters are removed only from bounded snapshots, not by scanning the complete raw stream. Line totals count a final unterminated line, and `lastLineBytes` remains exact even when one line exceeds the working buffer.
+Node 流在溢写路径中保持 raw，以获得吞吐量和精确的归档字节。`OutputCapture` 使用一个流式 `TextDecoder`，因此读取边界不会拆分 code point；无效的显示控制字符只从有界快照中移除，不会通过扫描完整 raw 流来移除。行总数包含最后一个未以换行结束的行，即使某一行超过工作缓冲区，`lastLineBytes` 仍保持精确。
 
-## 6. Remote execution
+## 6. 远程执行
 
-When worker and execution environment are colocated, updates are in-process and this publisher primarily bounds capture work. `ToolOutput` remains the downstream event/durability limiter.
+当 worker 与执行环境同机时，更新在进程内传递，该发布器主要用于限制捕获工作。`ToolOutput` 仍是下游事件/持久化限速器。
 
-When an execution environment is physically remote from its worker, the same bounded updates cross that transport. Full-force output cannot transfer the complete stream: intermediate writes collapse at the source, while the complete stream remains in the source-local spill.
+当执行环境与 worker 物理分离时，同样的有界更新会跨越传输边界。全速输出不会传输完整流：中间写入在源端折叠，完整流保留在源端本地溢写文件中。
 
-Each real costly boundary gets its own publisher instance. A colocated deployment may bypass transport serialization; a custom tool that bypasses `ExecutionEnv` still passes through the future `ToolOutput` publisher.
+每个真实的高成本边界都有自己的发布器实例。同机部署可以绕过传输序列化；绕过 `ExecutionEnv` 的自定义工具仍会经过未来的 `ToolOutput` 发布器。
 
-## 7. Remaining work
+## 7. 剩余工作
 
-- Move generic custom-tool composition, text retention, event publication, and durable cadence into `ToolOutput`.
-- Replace whole `AgentToolResult` progress with Chord operations at that downstream boundary.
-- Make memo and output checkpoint persistence one atomic transaction.
-- Seed replay from durable output rather than deleting it.
-- Put spills in an environment-owned session directory and sweep them after session lifetime plus a crash-retention floor.
-- Decide explicit limits for images and structured details; text is bounded, those values are not yet.
-- Define raw binary-output behavior. Current shell output remains lossy UTF-8 text.
+- 将通用自定义工具组合、文本保留、事件发布和持久节奏移入 `ToolOutput`。
+- 在下游边界用 Chord 操作替代完整的 `AgentToolResult` progress。
+- 让 memo 和输出检查点持久化使用一个原子事务。
+- 从持久输出而不是删除后的内容中为重放取种子。
+- 将溢写文件放入环境所有的 session 目录，并在 session 生命周期结束加崩溃保留下限后清理。
+- 决定图片和结构化详情的明确限制；文本已有上限，这些值尚未限制。
+- 定义原始二进制输出行为。当前 shell 输出仍是有损 UTF-8 文本。

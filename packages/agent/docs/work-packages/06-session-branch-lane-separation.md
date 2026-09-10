@@ -1,342 +1,87 @@
-# WP06 — Session, Branch, Lane separation
+# WP06 — Session、Branch、Lane 分离
 
-**Status: implemented before WP05 M4.** WP05 M3 remains complete. Retry/deferred work resumes on the composition, mutation, and ownership boundaries landed here.
+**状态：在 WP05 M4 之前已实现。** WP05 M3 保持完成；retry/deferred 工作在这里建立的 composition、mutation 和 ownership 边界上继续。
 
-This package replaces the mixed `SessionTree`/implicit-main inheritance design with four explicit concepts:
+本包用四个明确概念替代混杂的 SessionTree/隐式 main 继承：
 
-```text
-Session       global durable data + one mutation line
-Branch        one path through the entry tree, with a movable tip
-AgentLane     Branch data surface + agent operations/configuration
-AgentHarness  manager of AgentLanes; never a lane itself
-```
+~~~text
+Session       全局持久化数据 + 一条 mutation line
+Branch        entry tree 中的一条路径，可移动 tip
+AgentLane     Branch 数据面 + agent 操作/配置
+AgentHarness  AgentLane 管理器，本身不是 lane
+~~~
 
----
+## 0. 必读内容
 
-## 0. Mandatory reading
+完整阅读 harness.md、WP05、session types/session/memory、JSONL repo/storage、SQLite session/storage/repo、runtime lane/harness/restore/types、agent-harness、session fork、repository conformance，以及第 8 节列出的全部测试。不要查看删除的 runtime 实现或 Git history；当前 source、harness.md、WP05 和本包是唯一依据。
 
-Read completely before editing:
+## 1. 问题
 
-1. `packages/agent/docs/harness.md`.
-2. `packages/agent/docs/work-packages/05-direct-durable-drive.md`.
-3. `packages/agent/src/harness/session/types.ts`.
-4. `packages/agent/src/harness/session/session.ts`.
-5. `packages/agent/src/harness/session/memory.ts`.
-6. `packages/agent/src/harness/session/jsonl/repo.ts` and `jsonl/storage.ts`.
-7. `packages/session-backends/sqlite-node/src/sqlite/session.ts`, `storage.ts`, and repo implementation.
-8. `packages/agent/src/harness/runtime/lane.ts`, `harness.ts`, `restore.ts`, and `types.ts`.
-9. `packages/agent/src/harness/agent-harness.ts`.
-10. `packages/agent/src/harness/session/fork.ts` and repository conformance tests.
-11. Every test named in §8 before modifying it.
+### 1.1 SessionTree 混合不相关的 ownership
 
-Do not inspect deleted runtime implementations or Git history. Current source, `harness.md`, WP05, and this package are the only sources of truth.
+SessionTree 同时包含 lane/path 数据和 session-global 数据：Branch tip/entry query/append 与 getEntry、stats、全局 find、value/list、name/label 等。选择不同 tree view 只改变 global write 进入的 mutation queue，不改变 durable address，因此两个 view 可能在不同 lane line 上读取同一值并产生 lost update。
 
----
+### 1.2 Session 默认为 main
 
-## 1. Problem
+Session extends SessionTree，继承的 branch 方法和高层写入隐式委托给 main；session.setValue 实际是 setValueForLane("main")。新 repository session 在 harness 存在前还会创建部分 implicit main lane。
 
-### 1.1 `SessionTree` mixes unrelated ownership
+### 1.3 AgentHarness 默认为 main
 
-`SessionTree` currently contains:
+AgentHarness extends AgentLane，runtime Harness 也 extends Lane；manager 被放入自己的 lane map，名称为 main。harness.prompt、watch、getModel 等调用隐式针对 main。
 
-```ts
-interface SessionTree {
-	// Lane/path data.
-	getLeafId(...): Promise<string | null>;
-	findEntriesOnBranch(...): Promise<Entry[]>;
-	findEntryOnBranch(...): Promise<Entry | undefined>;
-	appendMessage(...): Promise<string>;
-	appendCustomEntry(...): Promise<string>;
+### 1.4 Per-lane mutation queue 没有解决当前问题
 
-	// Session-global data that is not lane- or branch-owned.
-	getEntry(...): Promise<Entry | undefined>;
-	getStats(...): Promise<SessionStats>;
-	findEntries(...): Promise<Entry[]>;
-	findEntry(...): Promise<Entry | undefined>;
-	getValue(...): Promise<StoredValue<unknown> | undefined>;
-	setValue(...): Promise<void>;
-	readList(...): Promise<ListElement<unknown>[]>;
-	appendList(...): Promise<void>;
-	getName(...): Promise<string | undefined>;
-	setName(...): Promise<void>;
-	getLabel(...): Promise<string | undefined>;
-	setLabel(...): Promise<void>;
-}
-```
+Storage 已经串行化原子 commit，并按 session 全局 seq 排序。per-lane queue 可以让 preparation 重叠，但当前 runtime 的 mutation callback 只做有界读取、准备一个 write set、最多提交一次、发布进程状态并返回；provider、tool、hook、timer 和异步 event delivery 都在线外。因此第一版使用一条 Session mutation line。只有 profiling 证明全局 line 是瓶颈后，才考虑 keyed line，并需重新审计 mutable ownership，但不需重设计公开 API。
 
-A selected tree view changes only which mutation queue a global write enters. It does not change the durable address. Two views can therefore read the same global value under different lane lines and commit a lost update.
-
-### 1.2 `Session` silently means `main`
-
-`Session extends SessionTree`. Its inherited branch methods and high-level writes silently delegate to the `main` lane. `session.setValue(...)` is actually `setValueForLane("main", ...)`. A fresh repository session creates a partial implicit main lane before any harness exists.
-
-### 1.3 `AgentHarness` silently means `main`
-
-`AgentHarness extends AgentLane`, and the runtime `Harness extends Lane`. The manager object is inserted into its own lane map as `main`. Calls such as `harness.prompt(...)`, `harness.watch(...)`, or `harness.getModel(...)` silently target main.
-
-### 1.4 Per-lane mutation queues solve the wrong problem
-
-Storage already serializes atomic commits and assigns one session-wide `seq` per write. Per-lane mutation queues allow useful preparation overlap, but this runtime does not need that complexity now: all harness mutation callbacks perform bounded storage reads, prepare one write set, commit at most once, publish process-local state, and return. Providers, tools, hooks, timers, and asynchronous event delivery are outside mutation callbacks.
-
-The approved first implementation uses one Session mutation line. Keyed lines may be added later if profiling proves the global line is a bottleneck; that future change requires a mutable-ownership audit but no public API redesign.
-
----
-
-## 2. Approved terminology and ownership
+## 2. 术语与 ownership
 
 ### Session
 
-Owns:
-
-- session metadata;
-- global entry and usage queries;
-- application values and lists;
-- session name and entry labels;
-- Branch discovery/creation;
-- one process-local mutation line for every supported mutation;
-- one open storage/backend lifecycle.
-
-A Session does not implement Branch and has no implicit branch.
+拥有 session metadata、全局 entry/usage query、应用 values/lists、session name/entry labels、Branch discovery/creation、一条处理所有支持 mutation 的进程内 line，以及一个 storage/backend lifecycle。Session 不实现 Branch，也没有 implicit branch。
 
 ### Branch
 
-Data-only capability describing one named path through the immutable entry tree.
-
-Owns only:
-
-- its current tip;
-- branch-relative entry queries;
-- direct extension of its tip with message or custom entries.
-
-A Branch has no model configuration, queues, operation state, drive, hooks, or agent policy.
+表示 immutable entry tree 中一条命名路径的数据能力，只拥有 current tip、branch-relative entry query 和直接扩展 tip 的 message/custom entry。Branch 没有 model config、queue、operation state、drive、hook 或 agent policy。
 
 ### AgentLane
 
-One Branch plus agent configuration and operations. It exposes Branch methods directly rather than exposing a nested `Branch`, tree, store, view, or access object.
-
-When idle, `AgentLane.appendMessage` / `appendCustomEntry` extend the tip directly. During an active run, they retain the existing deferred-write semantics: reserve the entry id, persist `pendingEntry(id)`, and enqueue the id in the operation inbox for checkpoint placement. A raw Branch append is always a direct data append; raw Branch mutation while a Harness owns the corresponding lane is a trusted-programming defect.
+一个 Branch 加 agent config/operation。直接暴露 Branch 方法，不暴露嵌套 Branch/tree/store/view。idle 时 append 直接扩展 tip；active run 时保留 deferred-write 语义：预留 entry ID、持久化 pendingEntry、将 ID 放入 operation inbox。原始 Branch append 始终是直接 data append；Harness 持有对应 lane 时，原始 Branch mutation 属于受信任代码缺陷。
 
 ### AgentHarness
 
-Owns global registries/configuration, hooks, events, lifecycle, and a map of AgentLanes. It is not an AgentLane and exposes no implicit-main operation methods.
+拥有 global registry/config、hooks、events、lifecycle 和 AgentLane map。它不是 AgentLane，不提供 implicit-main operation method。
 
----
+## 3. 目标公开类型
 
-## 3. Target public types
+### 3.1 Session reader 与 mutation
 
-### 3.1 Session reader and mutation
+SessionReader 提供 getEntries、typed getValue、scanValues、readList 和 scanBranch。SessionMutation extends reader，提供一次 commit(writes, context) 和 end(context)。commit 恰好允许零次或一次，第二次（包括首次失败后）拒绝；end 等待已接受的 commit、使 capability 失效并释放 line。SessionMutator 是去掉 end 的类型，mutate callback 接收 mutator 和 context。
 
-```ts
-export interface SessionReader {
-  getEntries(ids: string[], context: Context): Promise<Map<string, Entry>>;
-  getValue<T>(
-    address: Value<T>,
-    context: Context,
-  ): Promise<StoredValue<T> | undefined>;
-  scanValues<T>(prefix: Value<T>, context: Context): Promise<StoredValue<T>[]>;
-  readList<T>(
-    address: ValueList<T>,
-    options: ListReadOptions | undefined,
-    context: Context,
-  ): Promise<ListElement<T>[]>;
-  scanBranch(query: StorageBranchScan, context: Context): Promise<Entry[]>;
-}
-
-export interface SessionMutation extends SessionReader {
-  /** Exactly zero or one attempt. A second call rejects, including after failure. */
-  commit(writes: Write[], context: Context): Promise<CommitResult>;
-  /** Wait for any admitted commit, invalidate the capability, and release the Session line. */
-  end(context: Context): Promise<void>;
-}
-
-export type SessionMutator = Omit<SessionMutation, "end">;
-
-export type SessionMutationCallback<TResult> = (
-  mutator: SessionMutator,
-  context: Context,
-) => TResult | Promise<TResult>;
-```
-
-`beginMutation()`/`SessionMutation.end()` remain the transportable scope used by the current remote Session protocol. They are keyless and carry no lane field. Normal local/harness code uses `mutate()`; no caller selects a mutation key.
+beginMutation/end 是当前 remote Session protocol 使用的可传输 scope，不带 lane field；本地/harness 代码通常使用 mutate，不选择 mutation key。
 
 ### 3.2 Branch
 
-```ts
-export interface Branch {
-  readonly name: string;
-  getTipId(context: Context): Promise<string | null>;
-  findEntries(
-    query: BranchScan | undefined,
-    context: Context,
-  ): Promise<Entry[]>;
-  findEntry(
-    query: BranchScan | undefined,
-    context: Context,
-  ): Promise<Entry | undefined>;
-  appendMessage(message: AgentMessage, context: Context): Promise<string>;
-  appendCustomEntry(
-    customType: string,
-    data: JsonValue | undefined,
-    context: Context,
-  ): Promise<string>;
-}
-```
-
-Because the receiver is already a Branch, the public names are `findEntries` and `findEntry`, not `findEntriesOnBranch` and `findEntryOnBranch`.
+Branch 接口包含 name、getTipId、findEntries、findEntry、appendMessage、appendCustomEntry。receiver 已经是 Branch，所以不再使用 findEntriesOnBranch 等冗余名称。
 
 ### 3.3 Session
 
-```ts
-export interface Session<
-  TMetadata extends SessionMetadata = SessionMetadata,
-> extends SessionReader {
-  readonly metadata: TMetadata;
-  readonly idGenerator: IdGenerator;
-
-  // Direct reads. No mutation-line acquisition.
-  getEntry(id: string, context: Context): Promise<Entry | undefined>;
-  getStats(context: Context): Promise<SessionStats>;
-  findEntries(
-    query: EntryQuery | undefined,
-    context: Context,
-  ): Promise<Entry[]>;
-  findEntry(
-    query: EntryQuery | undefined,
-    context: Context,
-  ): Promise<Entry | undefined>;
-  getName(context: Context): Promise<string | undefined>;
-  getLabel(targetId: string, context: Context): Promise<string | undefined>;
-
-  // Existing Branch acquisition performs durable I/O and therefore receives Context.
-  branch(name: string, context: Context): Promise<Branch | undefined>;
-  createBranch(
-    name: string,
-    at: string | null,
-    context: Context,
-  ): Promise<Branch>;
-
-  // Transportable explicit scope; RemoteSession maps begin/read/commit/end over RPC.
-  beginMutation(context: Context): Promise<SessionMutation>;
-
-  // Trusted sharp edge. The callback holds the sole Session mutation line.
-  mutate<TResult>(
-    mutation: SessionMutationCallback<TResult>,
-    context: Context,
-  ): Promise<TResult>;
-
-  // One-write conveniences implemented through mutate().
-  setValue<T>(
-    address: Value<T>,
-    next: NoInfer<T>,
-    context: Context,
-  ): Promise<void>;
-  deleteValue<T>(address: Value<T>, context: Context): Promise<void>;
-  appendList<T>(
-    address: ValueList<T>,
-    element: NoInfer<T>,
-    context: Context,
-  ): Promise<void>;
-  deleteList<T>(address: ValueList<T>, context: Context): Promise<void>;
-  setName(name: string | undefined, context: Context): Promise<void>;
-  setLabel(
-    targetId: string,
-    label: string | undefined,
-    context: Context,
-  ): Promise<void>;
-
-  close(context: Context): Promise<void>;
-}
-```
-
-`mutate()` remains public. Plugins are trusted not to retain the mutator, invoke nested public writers, perform effects, or hold the line across unbounded work. Misuse may block every mutation in that Session and is a plugin defect. `beginMutation()` exists for transport/lifecycle integration rather than ordinary plugin work; every direct caller must call `end()` in `finally`.
+Session extends SessionReader，拥有 metadata、idGenerator、直接 global reads、name/label、branch(name)、createBranch(name, at)、keyless beginMutation、mutate、基于 mutate 的 set/delete value/list、name/label setters 和 close。mutate 是受信任 sharp edge：plugin 不能保存 mutator、嵌套 public writer、执行 effect 或长时间持有 line；beginMutation 的直接调用必须在 finally 中 end。
 
 ### 3.4 AgentLane
 
-`AgentLane` keeps its operation/configuration/observation methods and directly adds the Branch surface:
-
-```ts
-export interface AgentLane {
-  readonly name: string;
-
-  getTipId(context: Context): Promise<string | null>;
-  findEntries(
-    query: BranchScan | undefined,
-    context: Context,
-  ): Promise<Entry[]>;
-  findEntry(
-    query: BranchScan | undefined,
-    context: Context,
-  ): Promise<Entry | undefined>;
-  appendMessage(message: AgentMessage, context: Context): Promise<string>;
-  appendCustomEntry(
-    customType: string,
-    data: JsonValue | undefined,
-    context: Context,
-  ): Promise<string>;
-
-  getLastResult(context: Context): Promise<LaneLastResult | undefined>;
-  accept(
-    request: OperationRequest,
-    context: Context,
-  ): Promise<OperationAdmissionResult>;
-  drive(options: DriveOptions, context: Context): Promise<DriveResult>;
-  requestAbort(
-    operationId: string,
-    context: Context,
-  ): Promise<AbortRequestResult>;
-  inspectExecution(context: Context): Promise<LaneExecutionInfo>;
-  // Existing convenience, queue, configuration, idle, and watch methods remain.
-}
-```
-
-Delete `AgentLane.sessionTree`.
+AgentLane 直接增加 getTipId、findEntries、findEntry、appendMessage、appendCustomEntry，同时保留 getLastResult、accept、drive、requestAbort、inspectExecution 和原有 queue/config/idle/watch 方法。删除 AgentLane.sessionTree。
 
 ### 3.5 AgentHarness
 
-```ts
-export interface AcquireLaneOptions {
-  /** Used only when the AgentLane does not exist. Defaults to null. */
-  createAt?: string | null;
-}
+AgentHarness 提供 lane(name, context)、lane(name, options, context)、lanes、global name/label wrapper 及原有全局 tools/resources/options/settings/hooks/events/watchSession/close。lane 是原子 get-or-create；已有 lane 忽略 createAt，缺失 lane 使用 createAt ?? null。并发 acquisition 返回同一个已发布 AgentLane。新 Session/Harness 没有 implicit main，await harness.lane("main", context) 才创建 main，lanes() 可以返回空数组。
 
-export interface AgentHarness<
-  TContext extends object | undefined = object | undefined,
-> {
-  lane(name: string, context: Context): Promise<AgentLane>;
-  lane(
-    name: string,
-    options: AcquireLaneOptions,
-    context: Context,
-  ): Promise<AgentLane>;
-  lanes(context: Context): Promise<LaneInfo[]>;
+## 4. Mutation 与 read 语义
 
-  // Session-global metadata wrappers preserve existing value_update events.
-  getName(context: Context): Promise<string | undefined>;
-  setName(name: string | undefined, context: Context): Promise<void>;
-  getLabel(targetId: string, context: Context): Promise<string | undefined>;
-  setLabel(
-    targetId: string,
-    label: string | undefined,
-    context: Context,
-  ): Promise<void>;
+### 4.1 一条 Session mutation line
 
-  // Existing global tools/resources/options/settings/hooks/events/watchSession/close surface.
-}
-```
+用单个 MutationLine 替代 LaneMutationLine：
 
-`AgentHarness` does not extend `AgentLane`. Delete `createLane`; `lane()` is atomic get-or-create. Existing lanes ignore `createAt`. A missing lane uses `createAt ?? null`. Concurrent acquisitions return the same published AgentLane. Invalid names and unknown non-null targets reject with the existing tagged errors; close/fault reject with their existing lifecycle errors.
-
-A fresh Session and fresh Harness contain no implicit main Branch or AgentLane. `await harness.lane("main", context)` creates main completely. `lanes()` may return `[]`.
-
----
-
-## 4. Mutation and read semantics
-
-### 4.1 One Session mutation line
-
-Replace `LaneMutationLine` with a single `MutationLine`:
-
-```ts
+~~~ts
 export class MutationLine {
   private tail: Promise<void> = Promise.resolve();
   private sealedError: Error | undefined;
@@ -344,391 +89,129 @@ export class MutationLine {
   run<TResult>(operation: () => TResult | Promise<TResult>): Promise<TResult>;
   seal(error: Error): Promise<void>;
 }
-```
+~~~
 
-`StorageBackedSession.beginMutation()` acquires that line and returns one explicit keyless capability; only `end()` releases it. `mutate()` is the callback convenience built from begin/end and always ends in `finally`. The callback may read, prepare, commit once, publish process-local state, synchronously bind event recipients, and return. `close()` seals admission and waits for every acquired scope to end before closing Storage.
+StorageBackedSession.beginMutation 获取 line 并返回 keyless capability，只有 end 释放；mutate 基于 begin/end 并在 finally 结束。callback 可以读取、准备、提交一次、发布 process-local state、同步绑定 event recipient 后返回。close seal admission，并等待已取得的 scope end 后关闭 Storage。高层 Session write、Branch create/append、Lane.command、progress write、coherent restore snapshot 和 Harness lane acquisition 全部使用 Session.mutate。
 
-High-level Session writes, Branch creation/appends, every `Lane.command`, progress writes, restore snapshots requiring coherence, and Harness lane acquisition all call the same `Session.mutate()`.
+### 4.2 Read 绕过 line
 
-### 4.2 Reads bypass the line
+普通 Session/Branch read 直接调用 Storage，并看到每次 read 执行时最新完整提交：
 
-Ordinary Session and Branch reads call Storage directly. They observe the latest fully applied atomic storage commit at the time each read executes:
+- 排队/规划中的 mutation 不可见；
+- 多写 commit 不会部分可见；
+- Storage commit resolve 后，即使 callback 仍在发布 process state，direct read 也可以看到它；
+- 多次 line 外读取不是 snapshot；
+- read-decide-write/CAS 必须使用 mutate。
 
-- a queued/planning/unapplied mutation is invisible;
-- no partial commit is visible;
-- once Storage commit resolves, direct reads may observe it even while the mutation callback is still publishing process-local state;
-- multiple reads outside one `mutate()` are not a snapshot;
-- coherent read-decide-write/CAS uses `Session.mutate()`.
+### 4.3 Effect 在线外
 
-### 4.3 Effects stay outside
+mutation callback 不得执行或等待 provider/deferred fetch/cancel、tool、hook、timer、异步 event delivery、idle callback、Drive completion 或嵌套 mutator。callback 只能在 publication 后同步调用 emitBatch 来绑定 recipient；公开 operation 在 mutate 返回后等待 delivery。
 
-A mutation callback must not perform or await:
+### 4.4 Storage 仍独立保持原子性
 
-- providers or deferred fetch/cancel;
-- tools;
-- hooks;
-- timers;
-- asynchronous event delivery;
-- idle callbacks or Drive completion;
-- nested Session/Branch/AgentLane mutators.
+Storage 保留单 Session commit serializer，并为每个 write 分配全局 seq。Session line 保护 read-decide-commit-publication；Storage queue 保护事务应用、序号、fork snapshot 和后端 caller。两者不能合并。
 
-The callback may synchronously call `emitBatch` after publication to bind recipients and retain its delivery promise. The public operation awaits delivery after `mutate()` returns.
+## 5. Branch 与 lane 的持久化形状
 
-### 4.4 Storage remains independently atomic
+### 5.1 没有 implicit main
 
-Storage retains its one-session commit serializer and assigns one global `seq` per write. The Session mutation line protects read-decide-commit-publication procedures; the Storage queue protects atomic transaction application, sequence assignment, fork snapshots, and backend callers. Do not merge the two abstractions.
+repository create 只写 session metadata/header/catalog，不写 branch tip、lane config 或 lane state。删除 Memory/JSONL create 和 SQLite init 中的 main seed。legacy coding-agent v3 normalization 可以因为导入 transcript 有选定路径而产生 main Branch。
 
----
+### 5.2 Branch 完整性
 
-## 5. Branch and lane durable shape
+Branch 存在的唯一条件是 required tip value 存在。createBranch 校验 name、absence 和非 null target，然后在一次 mutation 写入 tip，不写 model config 或 operation state。
 
-### 5.1 No implicit main
+统一使用 branchTip/tipId，persisted namespace 使用 pi.branch.tip。format 4 和新 harness 是 WIP，应原地替换 leaf/lane 字段，不增加 version、migration、compat decoder 或旧格式拒绝。legacy v3 import 仍支持：把选定 main leaf 映射为 main Branch tip，并只沿选定 ancestry 分别重建最近 model_change、thinking_level_change、active_tools_change；不支持的最近值不回退到更旧历史。
 
-Repository `create()` writes only session metadata/header/catalog state. It writes no branch tip, lane configuration, or lane state. Remove main seeding from Memory and JSONL creation and from SQLite initialization.
+若能重建完整配置，导入器先写 laneConfig("main") 与 fresh idle laneState("main")；v3 没有持久化初始工具清单，因此缺失 active-tools history 归一化为 []。model/thinking 必需配置缺失或不支持时，只返回 data-only main Branch。更新 legacy active-tools record 以读取 encoded activeToolNames array，并同步 public tipId protocol/adapters。
 
-Legacy coding-agent v3 normalization may still produce a main Branch because the imported transcript has one selected path.
+### 5.3 AgentLane 完整性
 
-### 5.2 Branch completeness
+AgentLane 在既有 Branch 上增加完整 laneConfig、laneState、可选 laneLastResult 和可选 current operation。harness.lane 在一次 Session mutation 中按以下情况处理：
 
-A Branch exists exactly when its required tip value exists. `createBranch(name, at, context)` validates name, absence, and non-null target, then writes the tip in one mutation. It writes no model configuration or operation state.
+| 持久状态 | 结果 |
+| --- | --- |
+| Branch 和 lane value 都不存在 | 校验 createAt，提交 Branch tip、不可变 seed config、idle lane state，发布一个 AgentLane 与 lane_created |
+| Branch 存在，config/state 缺失且没有 last result | 在既有 tip 提交 seed config 和 idle state，发布 AgentLane 与 lane_created |
+| Branch 和完整 lane values 都存在 | 返回 restored/published AgentLane，不 commit、不发 event |
+| 任意部分或矛盾组合 | 作为 storage corruption fault |
 
-Use Branch terminology in source. This package renames the typed constructor and public concepts to `branchTip`/`tipId`. The persisted namespace and durable field spelling decision must be consistent across all backends and docs:
+commit callback 在离开 mutate 前把新 Branch/AgentLane 放入 process map，并同步 emitBatch(lane_created, context)；释放 line 后等待 delivery。AgentHarness.create 恢复完整 lane/open operation，但不创建 main。data-only Branch 直到显式 attach 才增加 agent state。
 
-- use `pi.branch.tip` and rename format-4 fields from leaf to tip rather than retain misleading new-code aliases;
-- format 4 and the new harness are WIP, so replace their schema and field names in place: no storage-version bump, migration, compatibility decoder, or old-format rejection path;
-- legacy coding-agent v3 import remains supported: it maps its selected main leaf to a main Branch tip and walks that selected physical ancestry to reconstruct the nearest `model_change`, `thinking_level_change`, and `active_tools_change` independently; unsupported nearest values do not fall back to older history;
-- when the importer can reconstruct a total configuration, it writes ordinary `laneConfig("main")` plus fresh idle `laneState("main")` before returning the Session; missing active-tools history normalizes to `[]` because v3 did not persist the initial tool inventory;
-- if required model or thinking configuration is missing or unsupported, the importer leaves a data-only main Branch rather than persisting partial compatibility state;
-- update the legacy active-tools record type to read its encoded `activeToolNames` array;
-- update protocol schemas and experimental adapters for public `tipId` fields in the same package.
+### 5.4 Append
 
-Inventory uses `branchTipInventoryPrefix()`. Legacy import emits only ordinary Branch/Lane values; there is no temporary compatibility address or attachment-time migration.
-
-### 5.3 AgentLane completeness
-
-An AgentLane adds total `laneConfig`, `laneState`, optional `laneLastResult`, and optional current operation values to an existing Branch.
-
-`harness.lane(name, options?, context)` executes one Session mutation and handles exactly these cases:
-
-| Durable state                                               | Result                                                                                                                                                                        |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Branch absent; lane values absent                           | validate `createAt`, commit Branch tip + the immutable `AgentHarnessOptions` seed config + idle lane state, publish one AgentLane and `lane_created { at: createAt ?? null }` |
-| Branch present; lane config/state absent and no last result | commit the immutable seed config + idle lane state at the existing tip, publish one AgentLane and `lane_created { at: existingTip }`                                          |
-| Branch and complete lane values present                     | return the restored/published AgentLane; no commit/event                                                                                                                      |
-| Any partial or contradictory combination                    | fault as storage corruption                                                                                                                                                   |
-
-The committing callback publishes the new Branch/AgentLane into process-local maps and synchronously calls `emitBatch(lane_created, context)` before returning from `Session.mutate()`. Event delivery is awaited after line release.
-
-`AgentHarness.create()` restores every complete durable AgentLane and open operation, but creates nothing and requires no main. A data-only Branch remains a Branch until `harness.lane(name, ...)` attaches agent state.
-
-### 5.4 Append behavior
-
-`Branch.appendMessage` / `appendCustomEntry` always commit an immutable entry parented to the current tip and move the tip in the same transaction.
-
-`AgentLane.appendMessage` / `appendCustomEntry` retain harness semantics:
-
-- idle: append and move tip immediately;
-- active run: stage `pendingEntry(id)` and enqueue `inbox.writes`;
-- active structural operation: retain the existing wait/re-evaluate contract when that surface lands;
-- pending assistant messages reject before commit.
-
-Both return the entry id reserved before their mutation.
-
----
+Branch.appendMessage/appendCustomEntry 始终在一个事务中创建以当前 tip 为 parent 的 immutable entry 并移动 tip。AgentLane idle 时立即 append；active run 时 stage pendingEntry 并 enqueue inbox.writes；active structural operation 保留既有 wait/re-evaluate；pending assistant append 在 commit 前拒绝。两者都返回预留的 entry ID。
 
 ## 6. Runtime composition
 
 ### 6.1 Harness
 
-Replace inheritance with composition:
-
-```ts
-export class Harness<
-  TContext extends object | undefined,
-> implements AgentHarness<TContext> {
-  readonly session: Session;
-  readonly models: Models;
-  readonly hooks: HookRegistry;
-  readonly events: HarnessEventBus;
-  readonly lanesByName = new Map<string, Lane<TContext>>();
-  // global config/lifecycle fields
-}
-```
-
-The constructor builds every restored Lane as an ordinary object. It never calls `super("main", ...)` and never inserts `this` into `lanesByName`.
-
-Fault and close iterate ordinary Lane objects. Global getters/setters live only on Harness. Coding-agent experimental services and workers must acquire/cache `main` explicitly before invoking lane operations.
+用 composition 替代 inheritance。Harness 持有 session、models、hooks、events 和 lanesByName，不调用 super("main")，也不把自身放进 lanesByName。restore 后每个 Lane 都是普通对象；fault/close 遍历普通 Lane；global getter/setter 只在 Harness。coding-agent service/worker 必须显式获取并缓存 main。
 
 ### 6.2 Lane
 
-`Lane.command` and `commandDriveOwned` call keyless `session.mutate(plan, context)`. The live `Lane.state` remains the authoritative process projection. Exact Drive fencing remains adjacent to commit admission.
-
-Lane directly implements Branch query/append names. It may hold a package-private Branch implementation for direct data reads, but no nested Branch is exposed publicly.
+Lane.command 和 commandDriveOwned 调用 keyless session.mutate；live Lane.state 是权威 process projection，exact Drive fence 保持在 commit admission 附近。Lane 直接实现 Branch query/append 名称，内部可以有 package-private Branch implementation，但不公开嵌套 Branch。
 
 ### 6.3 Restore
 
-Restore no longer enters a named mutation line. `AgentHarness.create()` owns the Session attachment interval and performs one bounded keyless `Session.mutate()` callback to inventory/restore every complete AgentLane before publishing the Harness; it commits only when an intentional attachment normalization is required. Coherent live watch/inspection likewise uses `Session.mutate()` as a no-commit callback.
+Restore 不再进入 named mutation line。AgentHarness.create 拥有 attachment interval，通过一次有界 keyless mutate callback 盘点/恢复完整 AgentLane 后发布 Harness；只有 attachment normalization 明确需要时才 commit。coherent watch/inspection 也使用无 commit 的 mutate。缺失 main 合法，data-only Branch 与完整 AgentLane 分开盘点。
 
-Restore inventories complete AgentLanes separately from data-only Branches. Missing main is legal.
+## 7. Repository、backend 与 fork 要求
 
----
+Memory/JSONL/SQLite 的 Session facade 删除 lane argument/field，保留 keyless beginMutation/end 转发、Branch acquisition/creation、line 外 direct read 和不变的 Storage commit sequencing。SQLite 与未来 SQL backend 仍由 Storage 串行化分配 seq 的 commit；不同 Session 仍可并发。
 
-## 7. Repository, backend, and fork requirements
+Fork 要保持一个 coherent source Storage snapshot，并将 leaf 改称 Branch tip：
 
-### Memory/JSONL/SQLite
+- branch scope 创建 destination Branch main；
+- 未指定 source entry 时要求 source main，否则拒绝；
+- source main 是完整 AgentLane 时，复制 config 并与 fresh idle state 一起写入；data-only source 只产生 data-only destination；
+- tree scope 复制每个 Branch tip；完整 AgentLane 复制 config + fresh idle state，data-only 保持 data-only；
+- operation/pending/last result/usage 排除；
+- destination 不获得无关 implicit main；
+- 保留显式 keyless begin/commit/end fork-ordering seam，在开始 snapshot 前先提交必须提交的 mutation，Storage 将 source snapshot 与 commit 排队以选择一致边界。
 
-All Session facades:
+## 8. 实现阶段与文件清单
 
-- remove lane arguments and lane fields from begin/mutate capabilities;
-- retain explicit `beginMutation(context)` / `SessionMutation.end(context)` forwarding for local lifecycle and remote transport;
-- keep an explicit scope admitted until `end()` and keep callback `mutate()` admitted through its implicit finally/end;
-- expose Branch acquisition/creation;
-- keep direct reads outside the line;
-- keep Storage commit sequencing unchanged.
+### Phase A — Session mutation 与 Branch
 
-SQLite and future SQL backends still serialize sequence-allocating commits in Storage. The Session mutation line intentionally serializes complete callbacks only within one open Session owner; separate sessions remain concurrent.
-
-### Forks
-
-Preserve one coherent source Storage snapshot. Update terms from lane leaf to Branch tip.
-
-- branch-scope fork creates destination Branch `main` at the copied path;
-- if no explicit source entry is provided, source `main` must exist or fork rejects;
-- branch scope copies source main's configuration and writes idle lane state **together iff** source main is a complete configured AgentLane; an unconfigured/data-only source main produces only a data-only destination main Branch;
-- tree scope copies every Branch tip; each complete configured source AgentLane copies its configuration plus fresh idle lane state together, while each data-only Branch remains data-only;
-- operation values, pending values/lists, last results, and usage rows remain excluded;
-- destination sessions do not gain an unrelated implicit main;
-- retain the explicit begin/commit/end fork-ordering seam: code that must admit a commit before starting a fork snapshot calls keyless `beginMutation()`, invokes `commit()`, starts the repository snapshot only after commit admission, and calls `end()` in `finally`; Storage queues the source snapshot against commits to choose one coherent boundary.
-
----
-
-## 8. Implementation phases and file manifest
-
-Public drive remains disabled. Complete this package before resuming WP05 M4.
-
-### Phase A — Session mutation and Branch
-
-**Rename**
-
-- `src/harness/session/lane-mutations.ts` → `mutation-line.ts`.
-
-**Modify**
-
-- `src/harness/session/types.ts` — `Branch`, keyless `Session.mutate` and keyless begin/end transport scope, no `SessionTree`, Session-global methods.
-- `src/harness/session/session.ts` — one line, Branch implementation, no implicit-main delegates, direct Branch append; rename lane-creation validation errors to Branch terminology.
-- Memory/JSONL/SQLite format-4 schema and codecs — replace WIP leaf/lane spellings in place; do not add a version gate or migration.
-- `src/harness/session/memory.ts`.
-- `src/harness/session/jsonl/repo.ts`, `jsonl/legacy-v3.ts`, and related open/create facade files.
-- `packages/session-backends/sqlite-node/src/sqlite/session.ts` and repo creation.
-- `src/harness/session/fork.ts`.
-- `src/harness/session/index.ts` and package exports.
-- storage/repository benchmarks and conformance call sites.
-
-**Rename tests**
-
-- `test/harness/session-tree.test.ts` → `branch.test.ts`.
-- `test/harness/session-create-lane.test.ts` → `session-create-branch.test.ts`.
-
-**Modify tests**
-
-- `test/harness/storage-backed-session.test.ts`.
-- `test/harness/memory-session-repo.test.ts`.
-- `test/harness/jsonl-session-repo.test.ts`.
-- `test/harness/memory-conformance.test.ts`.
-- `src/harness/session/testing/conformance/session-repo.ts`.
-- SQLite repo/storage tests.
-- compaction/branch-summarization type fixtures.
+将 lane-mutations.ts 改为 mutation-line.ts。修改 session types/session/memory、JSONL repo/legacy-v3、SQLite session/repo、fork、exports、storage/repository benchmark 和 conformance。用 Branch、keyless mutate、tipId、pi.branch.tip，移除 SessionTree 和 implicit main。将 session-tree.test.ts 改为 branch.test.ts，将 session-create-lane.test.ts 改为 session-create-branch.test.ts，并更新其余 storage/SQLite/compaction 测试。
 
 ### Phase B — Harness/Lane composition
 
-**Modify**
+修改 agent-harness、runtime harness/lane/restore/types、session values/durable types、已有 drive module 中的名称签名、branch summarization、protocol、coding-agent experimental service/worker 及测试。所有使用 keyed mutate、implicit Harness-as-main、sessionTree、leafId、createLane 的 runtime helper 都要更新。Phase A/B 必须作为一次原子 landing，不增加临时 alias。
 
-- `src/harness/agent-harness.ts`.
-- `src/harness/runtime/harness.ts`.
-- `src/harness/runtime/lane.ts`.
-- `src/harness/runtime/restore.ts`.
-- `src/harness/runtime/types.ts` where `leafId` becomes `tipId`.
-- `src/harness/session/values.ts` and durable state types for Branch tip naming.
-- all runtime drive modules already present (`checkpoint`, `generation`, `recovery`, `terminal`, `progress`) only where names/signatures change.
-- `src/harness/compaction/branch-summarization.ts`.
-- `packages/protocol/src/harness.ts`.
-- `packages/coding-agent/src/experimental/services/agent-controller-provider.ts`.
-- `packages/coding-agent/src/experimental/services/models-provider.ts`.
-- `packages/coding-agent/src/experimental/session-worker.ts`.
-- experimental harness wire/session worker tests.
+### Phase C — 规范文档
 
-**Modify focused tests**
+完整更新 harness.md：orientation、bound Branch tip、Branch/Session/fork/repository、tipId、唯一 mutation line、无 main attachment、各 public surface、event ordering、work package、invariant、race、backend conformance 和 glossary。同步更新 WP05、assistant/tool durability、values、telemetry、plugins、extensions 等当前文档，删除 SessionTree 和旧 ordering。remote Session 仍使用 keyless begin → local callback/remote read/one commit → publication → end RPC；server 持有 line 到 end acknowledgment，disconnect/timeout 按现有 hosting policy 终止 scope。released changelog 不改，非 main/PR 不加 changelog。
 
-- every `test/harness/runtime/*.test.ts` helper/call site using keyed mutate, implicit Harness-as-main, `sessionTree`, `leafId`, or `createLane`;
-- `test/harness/types.test.ts`;
-- `test/harness/branch-summarization.test.ts`;
-- protocol and coding-agent experimental tests.
-
-Phases A and B are one atomic landing. Removing `SessionTree`, keyed mutate, and Harness inheritance cannot compile as separately committed compatibility phases, and this package intentionally adds no temporary aliases.
-
-### Phase C — Normative documentation
-
-Update `packages/agent/docs/harness.md` completely and consistently:
-
-- orientation/system model and worked examples;
-- bound Branch tip addresses;
-- Branch, Session metadata, queries, forks, and repository boundary;
-- operation metadata/result/snapshot `tipId` terminology;
-- one Session mutation line in Parts 3–5;
-- attachment with no required main;
-- public Branch, AgentLane, AgentHarness, and Session surfaces;
-- event/watcher ordering under the Session line;
-- remove the old second harness-settings-line lock-order narrative: harness-global settings and every durable lane mutation now serialize through the sole Session line when a coherent snapshot is required; pure synchronous registry reads remain direct;
-- work-package table, invariants, races, backend conformance, and glossary.
-
-Update WP05 before M4:
-
-- replace `SessionTree`/lane-line/inheritance assumptions;
-- replace `leafId` source examples where the new type names require it;
-- keep all M0–M3 historical behavior and M4–M8 durable requirements;
-- state that WP06 is the foundation between M3 and M4.
-
-Update every current supporting document whose public names or ordering statements change:
-
-- `docs/assistant-durability.md` and `docs/tool-durability.md` — Session-line FIFO and `branchTip` terminology;
-- `docs/values.md` — Session-global value/list surface, Branch tip addresses, and no `SessionTree`;
-- `docs/telemetry.md` — receiver inventory and Session mutation spans;
-- `docs/plugins.md` — remove `sessionTree`; the plugin's AgentLane directly supplies Branch methods, while a scoped Session-data facet supplies global value/list/name/label/query methods and excludes raw `mutate`, `idGenerator`, close, and backend authority;
-- `docs/extensions/pi-extensions-v2.md` and `docs/extensions/pi-server-artifact/index.md` where examples/types use the changed surfaces;
-- completed WP00–WP04 only where a forward-looking/current-state statement would otherwise claim the removed API still exists.
-
-Retain the current remote Session mutation contract and update it from a named lane line to the sole Session line: worker `RemoteSession.mutate()` performs keyless begin RPC → local callback with remote reads/one remote commit → local post-commit publication → end RPC. The server holds the Session line through commit and publication until end acknowledgment. Disconnect/timeout terminates the scope under the existing hosting policy. Update the current remote protocol/vertical-slice documentation and every implementation/test present on dev; do not delete or defer this behavior.
-
-Do not rewrite released changelog sections. Add no changelog entry on a non-main/non-PR development branch.
-
----
-
-## 9. Required tests
+## 9. 必需测试
 
 ### Session mutation line
 
-- concurrent `mutate()` callbacks serialize globally, including callbacks invoked from different AgentLanes;
-- a second callback does not enter until the first callback returns after commit/publication;
-- direct reads do not wait for a callback that has not committed;
-- direct reads observe a fully landed commit even while that mutation callback remains open after commit;
-- no direct read observes a partial multi-write commit;
-- two read-modify-write counter mutations produce `1`, then `2`;
-- separate direct `getValue` + `setValue` calls remain deliberately non-atomic;
-- zero-commit callback is legal;
-- keyless `beginMutation()` excludes every other mutation until `end()`, commit does not release it, end-without-commit is legal, repeated end is idempotent, and close waits for end;
-- RemoteSession begin/read/commit/publication/end preserves that same scope;
-- second commit attempt rejects, including after a failed first attempt;
-- nested public write from a mutation callback is documented as invalid and deterministically blocks/rejects according to the chosen guard;
-- close-first rejects mutation; mutation-first completes and close waits; a trusted callback that never returns can block close;
-- Storage commit `seq` and stats behavior is unchanged.
+验证不同 AgentLane 的 mutate 全局串行、后一个 callback 等前一个完成 publication、direct read 不等待未 commit callback、完整 commit 不部分可见、两个 read-modify-write 得到 1/2、分离 get/set 仍非原子、零 commit 合法。验证 keyless begin 在 end 前阻塞其他 mutation、commit 不释放、无 commit end 合法、重复 end 幂等、close 等待 end、RemoteSession 保持相同 scope、第二次 commit 拒绝、嵌套写入按约定拒绝、close race、seq/stats 不变。
 
-### Session and Branch
+### Session 与 Branch
 
-- fresh Session has zero Branches and no main tip value;
-- no storage-version bump, migration, compatibility decoder, or rejection path is added for the replaced WIP format-4 schema;
-- legacy coding-agent v3 import reconstructs ordinary total main-lane configuration plus idle state before returning when valid model/thinking history exists; otherwise it returns a data-only main Branch;
-- legacy config tests cover complete and incomplete histories, invalid legacy fields, and branched histories where only changes on the selected main path apply;
-- `branch(name, context)` returns undefined for absence and receives the exact Context on reads;
-- `createBranch` validates name, target, and duplicate atomically;
-- two concurrent creates have one winner;
-- Branch queries default to its tip and preserve scan/filter/cursor behavior;
-- direct Branch message/custom append extends its tip atomically;
-- custom entry with absent data remains valid;
-- pending assistant append rejects;
-- Session global values/lists/name/labels/global queries no longer depend on a branch;
-- all pre-close Branch objects reject after close;
-- branch-scope fork copies config + idle state together iff source main is configured; tree scope does the same independently per configured lane; data-only Branches remain data-only;
-- explicit keyless begin/commit/end preserves commit-before-fork-snapshot ordering and captures one Storage-serialized snapshot boundary.
+新 Session 没有 Branch 和 main tip；format 4 无 version/migration/compat decoder；v3 import 对完整/不完整/非法/branched history 正确。验证 branch read/create、duplicate race、tip query/cursor、直接 append、absent custom data、pending assistant 拒绝、全局 values/lists/name/labels 不依赖 branch、close 后 Branch 失效、branch/tree fork 的 config/idle/data-only 规则，以及 begin/commit/end 对 fork boundary 的顺序。
 
-### AgentHarness and AgentLane
+### AgentHarness 与 AgentLane
 
-- Harness has no AgentLane methods at type or runtime;
-- Session has no Branch methods at type or runtime;
-- AgentLane has Branch methods directly and no `sessionTree`/nested Branch property;
-- fresh Harness `lanes()` is empty;
-- `lane("main")` creates complete main atomically;
-- missing named lane defaults to null tip; `createAt` anchors creation;
-- existing data-only Branch becomes one complete AgentLane without moving its tip;
-- existing complete AgentLane acquisition commits nothing and emits no creation event;
-- concurrent acquisitions return the same object and emit exactly one `lane_created`;
-- creation commit publishes the Lane and binds recipients before releasing `Session.mutate`;
-- invalid name/unknown anchor commit nothing;
-- restored complete lanes/open operations are inventoried without creating main;
-- partial Branch/config/lane-state combinations fault;
-- Harness global metadata wrappers retain commit → publication → `value_update` delivery;
-- AgentLane idle append moves the tip; active-run append stages one deferred write and preserves authoritative state;
-- close/fault seal every ordinary Lane without relying on Harness inheritance.
+验证 Harness 无 AgentLane method、Session 无 Branch method、AgentLane 直接提供 Branch method 且无 sessionTree、fresh lanes 为空、lane("main") 原子创建、createAt、data-only attach、已有完整 lane 不 commit、不发 event、并发 acquisition 只发一个 lane_created、publication 在 release 前完成、invalid name/anchor 不写入、restore 不创建 main、partial state fault、global wrapper event ordering、idle/active append 和 close/fault。
 
 ### Regression
 
-- M2 exact-Drive ABA fence still checks immediately before commit admission;
-- M3 generation intent/frame/settlement writes are byte-identical apart from renamed durable/public fields;
-- frame FIFO remains correct under the one Session line;
-- watch has only snapshot-first or publication-first outcomes;
-- usage totals remain commit-boundary exact across lanes;
-- Context remains trailing and source-identical throughout;
-- Memory, JSONL, and SQLite repository/storage conformance pass.
+保留 M2 exact-Drive ABA fence、M3 generation/frame/settlement write 形状（仅名称变化）、frame FIFO、watch 两种顺序、跨 lane usage totals、trailing/source-identical Context，以及 Memory/JSONL/SQLite conformance。
 
----
+## 10. 排除项
 
-## 10. Exclusions
+不增加 keyed mutation line、任意 lock name、resource lock、多锁排序、版本/optimistic retry、scheduler/transaction framework/action interpreter、AgentLane 嵌套 Branch/tree/store/access、SessionTree/view/implicit main/Harness method/createLane 兼容 alias、named remote scope、mutation 内 effect、第二套 Storage commit/seq、create 自动启动工作或 WP05 M8 之前的 public drive。
 
-Do not add:
+不改 provider/tool 行为、durable execution phase、retry/deferred policy 或 assistant frame 语义，除非是本包所需的名称/签名传播。
 
-- keyed mutation lines, arbitrary lock names, resource locks, multi-lock ordering, versions, or optimistic retries;
-- a scheduler, transaction framework, action interpreter, or generic post-commit task system;
-- a nested Branch/tree/store/access property on AgentLane;
-- compatibility aliases for `SessionTree`, `view`, implicit Session main methods, Harness lane methods, or `createLane`;
-- keyed/named begin/end RPC scopes or removal of the current keyless RemoteSession mutation transport;
-- effects inside `Session.mutate()`;
-- a second Storage commit/sequence mechanism;
-- automatic work start from `AgentHarness.create()` or `harness.lane()`;
-- public drive before WP05 M8.
+## 11. 校验
 
-Do not modify provider/tool behavior, durable execution phases, retry/deferred policy, or assistant-frame semantics beyond signature/name propagation required by this package.
+运行每个修改的 focused test，然后 git diff --check、npm run check、./test.sh。使用 rg 检查 SessionTree、sessionTree、LaneMutationLine、extends AgentLane、extends Lane、keyed mutate 等旧概念只剩历史说明或明确负向测试。完整实现和规范文档需在 commit 前通过 Fable review；未经用户明确同意不提交。
 
----
+## 12. 完成条件
 
-## 11. Validation
-
-Run every modified focused test, then:
-
-```bash
-git diff --check
-npm run check
-./test.sh
-
-rg -n "SessionTree|sessionTree|\.view\(|LaneMutationLine|extends AgentLane|extends Lane" \
-  packages/agent/src packages/agent/test packages/agent/docs \
-  packages/session-backends packages/protocol packages/coding-agent/src/experimental \
-  packages/coding-agent/test/experimental*
-
-rg -n "beginMutation\([^)]*,|mutate\([^)]*,[^)]*," \
-  packages/agent/src packages/agent/test packages/session-backends packages/coding-agent/src/experimental
-
-rg -n "session\.mutate\([^)]*\"|\.mutate\(\s*[a-zA-Z_$][a-zA-Z0-9_$]*\s*," \
-  packages/agent/src packages/agent/test packages/session-backends
-```
-
-Expected first grep matches only this package's problem statement, explicitly historical work-package API descriptions, negative type assertions, and unrelated coding-agent tree-widget names such as `SessionTreeNode`; no current harness `SessionTree` concept remains. The keyed-mutate grep must be empty after manually checking false positives.
-
-Review the complete implementation and normative doc update with Fable before committing. Do not commit without explicit user approval.
-
----
-
-## 12. Stop condition
-
-WP06 is complete when:
-
-- Session has one keyless mutation line; callback `mutate()` and explicit begin/commit/end remote transport share it, and neither accepts a lane key;
-- direct reads bypass that line and expose only fully applied Storage commits;
-- `SessionTree` and implicit-main Session behavior are gone;
-- Branch is the data-only path/tip abstraction;
-- AgentLane exposes Branch methods directly and retains operation-aware append semantics;
-- AgentHarness is composition-only, has no AgentLane methods, and atomically gets/creates lanes;
-- fresh Session/Harness require no main;
-- all process-local publication and event-binding boundaries remain correct;
-- all three backends and focused race tests pass;
-- `harness.md` and WP05 describe the new model consistently;
-- final Fable review reports no findings;
-- WP05 M4 may resume.
+Session 只有一条 keyless mutation line，callback mutate 与 remote begin/commit/end 共用它且都不接受 lane key；direct read 绕过 line；SessionTree 和 implicit main 消失；Branch 成为纯数据路径/tip；AgentLane 直接提供 Branch 方法并保留 operation-aware append；AgentHarness 只使用 composition 且原子 get/create lane；fresh Session/Harness 不要求 main；publication/event binding 边界正确；三后端和 race test 通过；harness.md/WP05 一致；Fable 无 findings；之后可恢复 WP05 M4。

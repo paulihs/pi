@@ -1,154 +1,125 @@
-# WP02 — Atomic acceptance and coherent lane observation
+# WP02 — 原子接受与一致的 lane 观测
 
-## Status
+## 状态
 
-Complete. Phase A established minimal attachment, open-operation inventory, Session-line inspection/watch capture, commit-continuation recipient binding, and in-band identity-failure vocabulary. Phase B landed in `beac75ecc` with focused, monorepo-check, full-suite, and final Fable review passing.
+已完成。Phase A 建立了最小 attachment、活动 operation inventory、Session line inspection/watch capture、commit continuation 中的 recipient binding，以及 in-band identity failure 词汇。Phase B 已在 beac75ecc 落地，focused tests、monorepo check、全套测试和最终 Fable review 均通过。
 
-Implementation also updated downstream protocol/coding-agent wire projections required by the changed public contract. No execution owner, provider/tool effect, timer, retry, polling, cancellation procedure, manual action, or terminal settlement was added.
+实现也更新了变更公开契约所需的 protocol/coding-agent wire projection。没有增加 execution owner、provider/tool effect、timer、retry、polling、cancellation procedure、manual action 或 terminal settlement。
 
-## Goal
+## 目标
 
-Deliver two effect-free boundaries:
+提供两个不涉及 effect 的边界：
 
-```text
+~~~text
 idle lane
-→ atomic prompt/skill/template acceptance
-→ durable open operation in payload-free starting
+→ 原子接受 prompt/skill/template
+→ 无 payload 的持久化 starting operation
 
-open or running lane
-→ Session-line watch capture
-→ complete snapshot plus gap-free subsequent events
-```
+open 或 running lane
+→ Session line watch capture
+→ 完整 snapshot 加无间隙的后续事件
+~~~
 
-After `AgentHarness.create(options, context)` succeeds:
+AgentHarness.create(options, context) 成功后：
 
-- every configured lane has a complete small process-local projection;
-- `open` inventories every durable current operation without predicting model/tool availability;
-- attachment starts no hook, provider, tool, timer, breakpoint, drive owner, or application callback;
-- `inspectExecution(context)` observes the small projection and local owner on the Session line;
-- `watch(context)` registers buffering, clones live presentation, and performs bounded snapshot reads in one no-write lane job;
-- every committing lane job publishes memory and synchronously binds its event batch in the commit continuation;
-- the mutation does not await listener delivery, while the public operation does.
+- 每个配置 lane 都有完整的小型进程内 projection；
+- open 只盘点持久化的当前 operation，不预测 model/tool 是否可用；
+- attachment 不启动 hook、provider、tool、timer、breakpoint、drive owner 或 application callback；
+- inspectExecution(context) 在 Session line 上观察小 projection 和本地 owner；
+- watch(context) 注册 buffering、复制实时 presentation，并在一个无写入 lane job 中完成有界 snapshot read；
+- 每个提交型 lane job 在 commit continuation 中发布 memory，并同步绑定 event batch；
+- mutation 不等待 listener delivery，但公开 operation 会等待。
 
-WP02 does not implement drive, provider generation, hooks, tools, retries, deferred polling, cancellation procedures, manual action execution, or terminal settlement.
+WP02 不实现 drive、provider generation、hooks、tools、retry、deferred polling、cancellation、manual action execution 或 terminal settlement。
 
-## Decisions
+## 决策
 
-### 1. Attachment restores projection, not presentation
+### 1. Attachment 恢复 projection，不恢复 presentation
 
-Passing the open Session to `AgentHarness.create()` transfers orchestration ownership until create rejects or the harness closes. Direct `Session.mutate`, `Session.createLane`, reserved-address writes, and second-harness construction are prohibited during that interval, so lane inventory cannot race an out-of-band lane creation.
+将 open Session 传给 AgentHarness.create() 后，编排所有权持续到 create 拒绝或 harness close。期间禁止直接 Session.mutate、Session.createLane、保留地址写入和创建第二个 harness，避免 lane inventory 与外部 lane creation 竞争。
 
-Attachment reads only:
+Attachment 只读取 branchTip、laneConfig、laneState、可选 laneLastResult，以及当前 operation 的 operationMeta、operationState。它校验必需值存在、operation ID/lane ownership 和 intent/state kind 一致；projection 损坏使 create 失败。
 
-- `branchTip`, `laneConfig`, `laneState`, optional `laneLastResult`;
-- `operationMeta` and `operationState` for a current operation.
+Attachment 不读取 transcript、queues、pending writes、drained payload、deferred source、frames、tool calls、args、checkpoints、preparations、memos 或 staged outcomes。这些引用由 watch 或消费时的 drive 校验。必需 payload 缺失/矛盾是存储损坏；可选 frame/checkpoint 缺失合法。
 
-It validates required existence, operation id/lane ownership, and intent/state kind compatibility. Projection corruption faults `create()`.
+### 2. Watch 负责详细 snapshot read
 
-Attachment does not read transcript, queues, pending writes, drained payloads, deferred sources, frames, tool calls, arguments, checkpoints, preparations, memos, or staged outcomes. Those references are checked by `watch()` or drive when consumed. Missing or contradictory required payload data is terminal storage corruption and faults that consumer. Optional frame/checkpoint absence is legal.
+一个无写入 Session mutation job 定义 watch 边界：
 
-### 2. Watch owns detailed snapshot reads
+~~~text
+等待所有早先 lane job 完成
+→ 同步注册 buffering watcher
+→ 同步复制 live presentation
+→ 在排除后续 lane job 时完成有界 durable reads
+→ 组装 snapshot
+→ 释放 Session line
+→ 返回 handle
+~~~
 
-One no-write Session mutation job defines the watch boundary:
+首次 watch、重连和执行中的 watch 使用同一流程，不设专用 cache。读取集合包括：当前 tip 的 compaction-bounded branch scan；nextRun/steer/follow-up/write/abort drain 的精确 pendingEntry；deferred source；tools 阶段的 assistant entry 和 effect_pending call 的 args；有界 assistant frame page 与可选 tool checkpoint。
 
-```text
-enter after all earlier lane jobs
-→ synchronously register buffering watcher
-→ synchronously clone live presentation state
-→ perform bounded durable reads while later lane jobs are excluded
-→ assemble snapshot
-→ release Session line
-→ return handle
-```
+ToolCall.sourceIndex 是完整 assistant message content 数组中的索引，不是过滤后的 tool-call ordinal；被表示的 call 必须指向 tool-call block。
 
-There is no special first-watch cache. The same path handles immediate post-attachment watch, reconnect, and watch during live execution.
+### 3. Recipient binding 放在 commit continuation
 
-The bounded read set is:
+成功提交的 lane job 依次执行：
 
-- one compaction-bounded branch scan from the current tip;
-- exact `pendingEntry(id)` reads for next-run, steer, follow-up, writes, and abort drains;
-- exact deferred source entry when represented;
-- tools-phase assistant entry and exact args for represented `effect_pending` calls, using `batch.turnId` as the args step id;
-- bounded exact assistant-frame pages and exact optional tool checkpoints.
-
-`ToolCall.sourceIndex` is the index in the assistant message's full content array, not a filtered tool-call ordinal. A represented call must index a tool-call block.
-
-### 3. Recipient binding belongs in the commit continuation
-
-A successful committing lane job performs:
-
-```text
+~~~text
 commit
-→ publish small owned projection
-→ synchronously bind recipients and append the complete `{ event, context }` batch
-→ return from the mutation without awaiting delivery
-→ await delivery before the public operation resolves
-```
+→ 发布小型自有 projection
+→ 同步绑定 recipient，并追加完整 { event, context } batch
+→ mutation 返回且不等待 delivery
+→ 公开 operation 在完成前等待 delivery
+~~~
 
-WP02 initially implemented this with `enqueue()` plus caller-operated `start()`. WP04 replaces that gate with one immediate `emitBatch()` call in the same commit-observation continuation. Recipient binding and delivery awaiting remain unchanged. A listener or watcher registered after `emitBatch()` cannot receive that historical event.
+WP02 曾用 enqueue()+调用方 start()；WP04 将其替换为同一 commit-observation continuation 中立即调用 emitBatch()。emitBatch 后注册的 listener/watcher 不能收到历史事件。
 
-The only watcher/publication orders are:
+唯一两种 watcher/publication 顺序：
 
-```text
-watcher first
-→ snapshot-before + complete buffered event batch
+~~~text
+watcher first       → snapshot-before + 完整 buffered event batch
+publication first   → snapshot-after + 不包含旧事件
+~~~
 
-publication/`emitBatch` first
-→ snapshot-after + no old event
-```
+live provider/tool 更新也采用同步 publish + emitBatch；frame/checkpoint commit 是排在 watch capture 后的 lane job。
 
-A live provider/tool presentation update follows the same synchronous publish-plus-`emitBatch` discipline. Frame/checkpoint commits are lane jobs and queue behind watch capture.
+### 4. Inspection 是无写入的 Session-line 观测
 
-### 4. Inspection is a no-write Session-line observation
+inspectExecution(context) 观察 lane、tip、未解析的 { provider, modelId }、current operation ID/kind/start time、running/open/durable aborting 状态，以及当前 durable phase 中记录的 model identity 和可选 latest result。不解析 model/tool registry，不读取 transcript 或 presentation payload。
 
-`inspectExecution(context)` observes:
+### 5. 缺失实现使用 in-band outcome
 
-- lane and tip;
-- configured model identity as unresolved `{ provider, modelId }` strings;
-- current operation id/kind/start time;
-- process status `running`, `open`, or durable `aborting`;
-- captured model identity when the current durable phase contains one;
-- optional latest result.
+不存在 blocked、missing-identity suspension、预测 classifier 或 acceptance registry preflight。
 
-It does not resolve model/tool registries and does not read transcript or presentation payloads.
+实际执行边界的规则：
 
-### 5. Missing implementations are in-band outcomes
+- provider model 或配置中的 active-tool definition 不可用，且 provider intent 尚未持久化时，产生不可重试的 configuration failure；
+- pre-intent failure 不保留 response/usage ID，也不伪造 assistant response/usage row；
+- 恢复的 effect_pending 先使用已有 reserved ID 解决不确定性；
+- deferred model 不可用时以 configuration failure 持久化放弃兑换；
+- requested tool 缺失时直接生成 isError ToolResultMessage 并继续；
+- 缺失或不再安全的 replay 实现生成 interruption，不等待。
 
-There is no `blocked`, missing-identity suspension, predictive classifier, or acceptance registry preflight.
+synthetic tool result 不带 details；details 的类型由工具负责，harness 不伪造 {} 或诊断对象。稳定错误码为：
 
-At the actual execution boundary:
+- model_unavailable，details { provider, modelId }；
+- configured_tools_unavailable，details { tools: string[] }。
 
-- unavailable captured model or configured active-tool definition before provider intent becomes a non-retryable configuration failure;
-- pre-intent configuration failure reserves no response/usage ids and fabricates no assistant response or usage row;
-- restored `effect_pending` settles uncertainty under its existing reserved ids before any later configuration failure;
-- unavailable deferred model durably abandons redemption through configuration failure; R7 implements and tests restored `effect_pending` abandonment, including deletion of its exact old assistant-frame list while dropping the reserved response/usage strings without fabricating settlement;
-- missing requested tool stages a direct `isError` `ToolResultMessage` and continues;
-- missing/no-longer-safe replay implementation synthesizes interruption instead of waiting.
+failure_drain 增加 { kind: "configuration" } provenance。实际转换由对应 execution package 落地，WP02 只提供规范和 source vocabulary。
 
-Synthetic harness tool results omit `details`. A tool owns the type of its details contract; the harness must not invent `{}` or a diagnostic object. `isError` and human-readable content carry the tool-level diagnosis. Run-level configuration failure remains machine-readable through `OperationError` and `laneLastResult`.
+### 6. Acceptance 独立于进程 registry
 
-Stable configuration error codes:
+Acceptance 校验持久化 caller input 和 lane state，而不是当前 model/tool registration。这避免 time-of-check/time-of-use 问题，允许在一个进程接受、另一个进程执行。
 
-- `model_unavailable`, details `{ provider, modelId }`;
-- `configured_tools_unavailable`, details `{ tools: string[] }`.
+配置错误的 convenience prompt 最终由 drive 返回持久化失败 run；hosted acceptance 即使 execution worker 尚未加载实现，也应先持久化。
 
-`failure_drain` gains `{ kind: "configuration" }` provenance. Actual transitions land with their owning execution packages; WP02 lands the normative/source vocabulary only.
+### 7. Invocation Context 保持显式
 
-### 6. Acceptance is independent of process registries
+所有公开 harness/lane 操作的最后参数仍是 context: Context。acceptance、attachment、watch、Session read/commit、fault 和 event publication 都传递它。共享 harness/lane/Session 不保存 caller Context；context 及其 signal/telemetry 不属于持久化业务数据。
 
-Acceptance validates durable caller input and lane state, not current model/tool registrations. This avoids a time-of-check/time-of-use check and permits acceptance in one process followed by execution in another.
+## 最终公开契约
 
-A misconfigured convenience prompt eventually returns a durable failed run from drive. Explicit hosted acceptance remains durable even before an execution worker loads implementations.
-
-### 7. Invocation Context remains explicit
-
-Every current public harness/lane operation receives trailing `context: Context`. Acceptance, attachment, watch capture, Session reads/commit, faults, and event publication preserve it. Shared harness/lane/Session receivers retain no caller Context. Context and its signal/telemetry values are never durable business data.
-
-Buffered events retain the exact emitting Context. Invocation cancellation remains distinct from durable `requestAbort()`.
-
-## End-state public contract
-
-```ts
+~~~ts
 export interface ModelIdentity {
   provider: string;
   modelId: string;
@@ -163,380 +134,107 @@ export interface OpenOperation {
   startedAt: number;
   aborting?: true;
 }
+~~~
 
-export interface CurrentOperationInfo {
-  id: string;
-  kind: "run" | "compaction" | "navigation";
-  startedAt: number;
-  status: OperationStatus;
-  capturedModel?: ModelIdentity;
-}
+open 每个持久化当前 operation 恰好一项，不包含 idle lane；aborting:true 只来自 durable cancel_requested。open 是 inventory，不是调度或 identity 建议。普通应用建立 watch 后调用 resume(context)，hosted scheduler 保留 expected-id drive fence。配置/捕获的 identity 是 durable string，不能解析。
 
-export interface LaneExecutionInfo {
-  lane: string;
-  tipId: string | null;
-  configuredModel: ModelIdentity;
-  current: CurrentOperationInfo | null;
-  lastResult?: LaneLastResult;
-}
+### Outcome
 
-export interface LaneInfo {
-  name: string;
-  tipId: string | null;
-  operation: CurrentOperationInfo | null;
-}
+删除 MissingIdentitySuspension、MissingIdentities、missing-identity drive waiting 和相关 suspension event。保留 provider 语义的 deferred suspension：
 
-export interface AgentHarnessConstructor {
-  create<TContext extends object | undefined = object | undefined>(
-    options: AgentHarnessOptions<TContext>,
-    context: Context,
-  ): Promise<{ harness: AgentHarness<TContext>; open: OpenOperation[] }>;
-}
-```
+~~~ts
+{ kind: "suspended", reason: "deferred", ... }
+~~~
 
-Rules:
-
-- `open` has exactly one item per durable current operation and omits idle lanes;
-- `aborting:true` comes only from durable `cancel_requested`;
-- `open` is inventory, not scheduling or identity advice;
-- normal applications establish watch and call `resume(context)`;
-- hosted schedulers retain expected-id `drive` fencing;
-- configured/captured identity fields are durable strings and may not resolve.
-
-### Outcomes
-
-Delete `MissingIdentitySuspension`, `MissingIdentities`, missing-identity drive waiting, and missing-identity suspension events.
-
-Keep deferred suspension as provider semantics:
-
-```ts
-{ kind: "suspended"; reason: "deferred"; ... }
-```
-
-WP05 removes the withdrawn action outcome before execution is enabled. Convenience operation outcomes remain operation-tagged branches of `ResumeOutcome`.
+WP05 会在启用 execution 前删除撤回的 action outcome；convenience operation outcome 仍是 ResumeOutcome 的 operation-tagged branch。
 
 ### Snapshot
 
-```ts
-export interface LaneSnapshot {
-  lane: string;
-  transcript: Entry[];
-  tipId: string | null;
-  lastResult?: LaneLastResult;
-  operation: null | {
-    id: string;
-    kind: "run" | "compaction" | "navigation";
-    startedAt: number;
-    status: OperationStatus;
-    action?: ActionInfo;
-    retry?: { attempt: number; maxAttempts: number; nextAttemptAt: number };
-    deferred?: { handle: DeferredHandle; poll: number };
-    drained?: { steer: QueuedItem[]; followUp: QueuedItem[] };
-    streamingMessage?: AssistantMessage;
-    runningTools: {
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      partialResult?: AgentToolResult<unknown>;
-    }[];
-  };
-  queues: { steer: QueuedItem[]; followUp: QueuedItem[]; nextRun: QueuedItem[] };
-  pendingWrites: {
-    entryId: string;
-    type: EntryType;
-    customType?: string;
-    message?: AgentMessage;
-    data?: JsonValue;
-  }[];
-  faulted: boolean;
-}
-```
+snapshot 的 operation 继续包含 id、kind、startedAt、status、action、retry、deferred、drained、streamingMessage 和 runningTools；runningTools 使用 toolCallId、toolName、args、可选 partialResult。配置不重复写入 snapshot；inspectExecution 暴露 model identity，getter 暴露当前配置。
 
-Configuration is not duplicated in snapshots. `inspectExecution()` exposes configured/captured model identities; getters expose current configuration.
+## 原子 run acceptance
 
-## Atomic run acceptance
+WP02 实现 prompt、skill、prompt-template 的 accept()；compaction/navigation 由各自 execution package 接受。
 
-WP02 implements `accept()` for prompt, skill, and prompt-template requests. Compaction/navigation acceptance remains with their execution packages.
+在 Lane.command(plan, context) 之前完成与状态无关的 normalization：prompt string/images、message 或 message array、skill/template 格式、pending assistant 拒绝、未知资源错误，以及 caller 提供或新生成的 operation/prompt-entry ID。
 
-State-independent normalization occurs before `Lane.command(plan, context)`:
+public prompt convenience overload 保持 [text, images | undefined, context] 和 [messageOrMessages, context]；其实现仍是 SliceNotImplemented，直到 R2。
 
-- prompt strings/images;
-- supplied message or message array;
-- explicit skill formatting;
-- prompt-template formatting;
-- pending assistant rejection;
-- unknown skill/template errors;
-- supplied or minted operation and prompt-entry ids.
+一个 lane command 内：
 
-Public prompt convenience overloads remain exactly `[text, images | undefined, context]` and `[messageOrMessages, context]`, but convenience implementations remain `SliceNotImplemented` until R2.
+1. 拒绝 busy；
+2. 捕获当前 pendingNextRun IDs；
+3. 读取并校验 pending message；
+4. 拒绝零个已放置 message；
+5. 在 request prompt 前设置 captured next-run entry 的 parent；
+6. 只提交一次；
+7. 发布小 projection；
+8. 同步以 accepting Context 调用 emitBatch；
+9. mutation callback 返回且不等待 delivery；
+10. accept 等待 event delivery 后返回。
 
-Inside one lane command:
+写入为：insert captured nextRun entries、insert request prompt entries、delete captured pendingEntry、set branchTip、set operationMeta、set operationState(run starting)、set laneState(current operation, pendingNextRun=[]）。事件顺序为 run_start，然后每个 message 的 message_start、message_end、entry_added，最后在捕获 nextRun 时发送 queue_update。Acceptance 不启动 drive/effect，也不写 Context。
 
-1. reject busy;
-2. capture current `pendingNextRun` ids;
-3. read and validate captured pending messages;
-4. reject zero placed messages;
-5. parent captured next-run entries before request prompt entries;
-6. commit exactly once;
-7. publish the small owned projection;
-8. synchronously call `emitBatch` with the acceptance event batch and accepting Context;
-9. return from the mutation callback without awaiting delivery;
-10. await event delivery before `accept` resolves.
+## Phase A — 规范重写
 
-Exact writes:
+先更新 harness.md：改为最小 projection restore、open inventory、未解析 identity inspection、Session-line ad hoc watch、commit continuation recipient binding；删除 identity preflight/suspension/error/event；定义 in-band model/tool unavailable、configuration provenance、detail-free synthetic tool result，并更新 invariant、race、roadmap、glossary 和 Appendix C。
 
-```text
-insert captured nextRun message entries
-insert request prompt entries
-delete captured pendingEntry values
-set branchTip
-set operationMeta
-set operationState(run starting)
-set laneState(current operation, pendingNextRun=[])
-```
+停止评审包括 git diff --check、Terra contradiction/source-feasibility audit、完整上下文 Fable review；修复全部问题后重复，获得用户批准再进入 runtime source。
 
-Exact event order:
+## Phase B — 实现
 
-```text
-run_start
-for each placed message:
-  message_start
-  message_end
-  entry_added
-queue_update if nextRun was captured
-```
+### Public/durable types
 
-Acceptance starts no drive or effect and writes no Context.
+agent-harness.ts 删除旧 suspension/identity 类型和 branch，加入 ModelIdentity、OperationStatus、OpenOperation 及新的 inspection/snapshot 类型；create 结果从 suspended 改为 open；保留所有 trailing Context。
 
-## Phase A — normative rewrite
-
-Update `harness.md` before runtime source:
-
-- replace eager attachment hydration with minimal projection restore;
-- replace predictive status/classifier with open inventory;
-- specify configured/captured identity inspection without resolution;
-- move detailed reads to ad-hoc Session-line watch capture;
-- require recipient binding in the exact commit-observation continuation;
-- remove identity preflight/suspension/error/event types;
-- specify in-band model/tool unavailability and configuration provenance;
-- require direct detail-free synthetic tool-result messages;
-- update invariants, races, roadmap, glossary, and Appendix C.
-
-Review stop:
-
-1. `git diff --check`;
-2. fresh Terra contradiction/source-feasibility audit;
-3. full-context Fable review against complete docs and source;
-4. resolve all findings and repeat until no findings;
-5. obtain user approval before runtime source.
-
-## Phase B — implementation
-
-### Public and durable types
-
-Modify `agent-harness.ts`:
-
-- remove `SuspendedOperation`, `MissingIdentityInfo`, `MissingIdentities`, and missing-identity outcome/event branches;
-- add `ModelIdentity`, `OperationStatus`, `OpenOperation`, and corrected inspection/snapshot types;
-- change create result from `suspended` to `open`;
-- land operation-tagged action-required outcome families;
-- correct `executeAction`/`runToCompletion` signatures;
-- retain trailing Context everywhere.
-
-Modify session types:
-
-- add `failure_drain` configuration provenance;
-- add the already-normative `ToolCall.outcome_ready` vocabulary without producers;
-- document `sourceIndex` as full assistant-content index;
-- add callback-scoped `scanBranch` to `SessionReader`; inheritance by `SessionMutator` and `Session` is intentional;
-- implement it in `StorageBackedSession` and its mutator and `MemorySessionFacade`; Session mutation authority remains process-local and has no remote Session facade.
+session types 增加 failure_drain provenance、ToolCall.outcome_ready、完整 content index 的 sourceIndex、callback-scoped scanBranch，并在 StorageBackedSession、mutator、MemorySessionFacade 实现。Session mutation authority 仍为进程内，不提供 remote Session facade。
 
 ### Event publication
 
-WP02 initially added synchronous recipient binding with a reserved delivery gate. WP04 supersedes only that mechanism:
+HarnessEventBus.emitBatch() 同步 snapshot 普通 recipient 和 watcher；delivery 只使用该绑定列表；watcher buffer 保留 { event, context }。LaneCommand 的 post-commit event batch 同步保留，commit 成功后 Lane.command 发布 next、最终 mutation action 调用 emitBatch，再在 Session.mutate 外等待 delivery。直接 idle/pending append、lane config、session name/entry label setter 都走该路径。
 
-- `HarnessEventBus.emitBatch()` snapshots ordinary and watcher recipients synchronously;
-- delivery uses only that bound list;
-- watcher buffers retain `{ event, context }`;
-- a watcher registered after `emitBatch` receives nothing from that event.
+WP04 还把 harness lane publication 放进 Session.createLane 的 committed-publication callback；Session commit 后发布 lanesByName 和 lane_created，再在释放 line 后等待 delivery。不要在线上执行 listener。
 
-`LaneCommand` commit decisions retain a synchronous post-commit event batch. After commit succeeds, `Lane.command` publishes `next`, calls `emitBatch` as its final mutation action, and carries the delivery promise outside `Session.mutate` before awaiting it. Every existing event-producing commit uses this path, including direct idle/pending appends, lane configuration setters, and session-name/entry-label setters.
+### Attachment、Inspection、Watch
 
-WP04 also moves harness lane publication into `Session.createLane`'s committed-publication callback. Session commits, Harness publishes `lanesByName` and calls `emitBatch(lane_created)` in that continuation, and Session awaits the retained delivery promise after releasing the line.
+restore.ts 保持 projection-only，校验 lane/operation ownership 和 kind，删除 describeSuspension 与 payload hydration。inspectExecution 是无写入 Lane.command，只从 durable phase 得到未解析 model identity。watch 在一个无写入 lane job 中同步注册 watcher、复制 live presentation、通过 callback-scoped reader 完成上面的有界读取、组装隔离 payload，必要 corruption 时 fault/unsubscribe，再释放 line；不要建立持久 hydration cache 或通用 reducer。
 
-Do not execute listeners on the line.
+### 不在范围内
 
-### Attachment
+未完成部分的 drive、resume、prompt convenience、compaction/navigation acceptance、abort/queues、executeAction、runToCompletion 仍是 SliceNotImplemented。WP02 不增加 effect、active operation、timer、hook、provider request、tool execution、retry、deferred fetch、cancellation reconciliation 或 terminal transaction。
 
-Keep `restore.ts` projection-only. Validate lane/operation ownership and kind compatibility. Remove `describeSuspension` and all payload hydration from `createAgentHarness`. Construct lanes and return `open` inventory without resolving registries.
-
-### Inspection
-
-Implement `inspectExecution(context)` as a no-write `Lane.command` observation. Derive captured model identity from the current durable phase. Read no storage payloads and resolve no registry identities.
-
-### Watch
-
-Implement `watch(context)` as one no-write lane job:
-
-- register watcher and clone live presentation synchronously;
-- perform the bounded read matrix above through callback-scoped readers;
-- assemble isolated snapshot payloads;
-- fault and unsubscribe on required corruption;
-- retain legal optional absence;
-- release the line before returning.
-
-A focused internal snapshot helper is allowed. Do not create a persistent hydrated presentation cache or generic reducer.
-
-### Out of scope
-
-`drive`, `resume`, prompt convenience, compaction/navigation acceptance, abort/queues, `executeAction`, and `runToCompletion` remain `SliceNotImplemented` where not already implemented.
-
-Provider/tool/configuration-failure transitions are specified now but implemented by R2/R3/R4/R7/R8. WP02 adds no effect, active operation, timer, hook, provider request, tool execution, retry, deferred fetch, cancellation reconciliation, or terminal transaction.
-
-## Required tests
+## 必需测试
 
 ### Public types
 
-- `SuspendedOperation`, `MissingIdentities`, and missing-identity status/outcomes/events are absent;
-- open/current/status unions narrow exhaustively;
-- configured and captured model identities are unresolved strings;
-- action-required outcome families and method signatures match;
-- prompt overload tuples remain exact;
-- `AgentHarnessOptions` has no receiver telemetry default.
+验证旧 suspension/identity 类型和状态不再存在；open/current/status 可穷举收窄；model identity 始终是未解析 string；action-required outcome 和方法签名、prompt overload tuple 正确；AgentHarnessOptions 没有 receiver telemetry default。
 
 ### Acceptance
 
-- text-only, images-only, text-plus-images, supplied arrays;
-- pending assistant rejection;
-- skills/templates and unknown resources;
-- empty input writes nothing unless captured nextRun supplies input;
-- no identity registry preflight;
-- supplied/minted operation ids;
-- exact writes, parent chain, metadata, starting state, settings, commit materialization;
-- pending-next-run capture/deletion;
-- busy run/structural operation;
-- one concurrent accept winner;
-- commit failure and close races;
-- exact event order and object-identical accepting Context;
-- no hook, provider, tool, timer, drive-owner, or option callback invocation; passive event-listener delivery remains required.
+覆盖 text、images、组合输入、数组、pending assistant 拒绝、skill/template、未知资源、空输入、无 registry preflight、caller/minted IDs、精确写入与 parent chain、starting state、pending-next-run capture/deletion、busy、并发 winner、commit/close race、精确 event order 和 object-identical Context。确认没有 hook/provider/tool/timer/drive-owner/option callback。
 
-### Attachment and inspection
+### Attachment/inspection
 
-- idle omitted and every open operation inventoried;
-- durable cancellation sets only `aborting:true`;
-- no transcript/pending/frame/tool reads at create;
-- configured and captured model identities may differ and remain visible when unresolved;
-- inspection runs on the Session line and performs no payload reads;
-- projection corruption faults create;
-- no option callback/effect starts.
+覆盖 idle omission、每个 open operation inventory、durable cancellation 的 aborting:true、create 不读 transcript/pending/frame/tool、model identity 不解析、projection corruption、无 effect start。
 
-### Event publication and watch
+### Event publication/watch
 
-- recipient set binds at `emitBatch`: a watcher registered after publication but before delivery receives nothing;
-- state/event batch publication happens before Session-line release;
-- direct append, lane configuration, session-name/entry-label, acceptance, and lane-creation commits all use that publication path;
-- `value_update` and `lane_created` bind recipients in their commit continuation, so later listeners receive neither historical event;
-- watcher-first gives snapshot-before plus complete events;
-- publication-first gives snapshot-after without old events;
-- live update during awaited capture appears only as a buffered event after the cloned live snapshot;
-- frame/checkpoint mutations queue behind capture;
-- first watch and reconnect use the same path;
-- exact transcript, queues, writes, drain, deferred, frame, tool args/checkpoint fields;
-- required payload corruption faults watch and removes watcher;
-- absent frames/checkpoints omit optional partials;
-- pre-registration lifecycle is not replayed;
-- buffered events retain object-identical emitting Context;
-- payload mutation cannot affect later state/listeners;
-- close/fault lifecycle matches the event bus.
+验证 emitBatch 时绑定 recipient；publication 后才注册的 watcher 不收历史事件；publication 位于 Session-line release 之前。覆盖 direct append、lane config、name/label、acceptance、lane-created commit，watcher-first/publication-first，live update buffer，frame/checkpoint 排队，首次 watch 与 reconnect 同路径，精确 transcript/queue/drain/deferred/frame/tool args/checkpoint，corruption fault/unsubscribe，optional absence，context identity，payload isolation 和 close/fault lifecycle。
 
-### In-band identity vocabulary
+### In-band identity
 
-Type/direct-state tests prove:
+验证 acceptance 没有 MissingIdentities 分支，configuration failure provenance 与稳定 code 可表示，deferred abandonment 归 R7，缺失工具的 ToolResultMessage 可不含 details，sourceIndex 是完整 content index，outcome_ready 不渲染为 running。
 
-- acceptance has no `MissingIdentities` path;
-- configuration failure provenance and stable error codes are representable;
-- deferred configuration abandonment remains assigned to R7 rather than adding an execution transition here;
-- missing-tool synthetic `ToolResultMessage` may omit `details`;
-- sourceIndex uses full assistant-content indexing;
-- outcome-ready calls are not rendered as running.
+## 文件
 
-No execution transition is added in WP02.
+新增 runtime2 accept test 和必要的 focused watch test。修改 harness 规范、agent-harness、events、session types/session/memory/remote、server remote manager、runtime2 harness/lane/restore/types 及相关测试。预期不改 backend schema、telemetry schema、coding-agent 或 changelog；若需要改动，应先停下做边界评审。
 
-## Files
+## 校验
 
-### Add
+Phase A 运行针对文档的 git diff --check。Phase B 在 packages/agent 运行 runtime2 accept、harness、lane、restore、types focused Vitest，回根目录后运行 git diff --check、npm run check、./test.sh。不要运行 npm test、完整 Vitest 或 npm run build，除非用户要求。
 
-- `packages/agent/test/harness/runtime2/accept.test.ts`
-- focused watch tests if existing files become oversized.
+runtime2 source baseline 为 967 行；超过 1900 行应触发设计评审，而不是目标。
 
-### Modify
+## 完成条件
 
-- `packages/agent/docs/harness.md`
-- `packages/agent/docs/work-packages/02-atomic-run-acceptance.md`
-- `packages/agent/src/harness/agent-harness.ts`
-- `packages/agent/src/harness/events.ts`
-- `packages/agent/src/harness/session/types.ts`
-- `packages/agent/src/harness/session/session.ts`
-- `packages/agent/src/harness/session/memory.ts`
-- `packages/agent/src/harness/session/remote.ts`
-- `packages/server/src/remote-session-manager.ts`
-- `packages/agent/src/harness/runtime2/harness.ts`
-- `packages/agent/src/harness/runtime2/lane.ts`
-- `packages/agent/src/harness/runtime2/restore.ts`
-- `packages/agent/src/harness/runtime2/types.ts`
-- `packages/agent/test/harness/runtime2/harness.test.ts`
-- `packages/agent/test/harness/runtime2/lane.test.ts`
-- `packages/agent/test/harness/runtime2/restore.test.ts`
-- `packages/agent/test/harness/types.test.ts`
-- `packages/agent/test/harness/storage-backed-session.test.ts`
-- `packages/agent/test/harness/memory-session-repo.test.ts`
-- `packages/server/test/conformance.test.ts`
-- event/session test files required by recipient binding and callback-scoped branch reads.
-
-No backend schema, telemetry schema, coding-agent, or changelog change is expected. Stop for boundary review if one becomes necessary. On `dev`, defer changelog entries.
-
-## Validation
-
-After Phase A:
-
-```bash
-git diff --check -- \
-  packages/agent/docs/harness.md \
-  packages/agent/docs/work-packages/02-atomic-run-acceptance.md
-```
-
-After Phase B:
-
-```bash
-cd packages/agent
-node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
-  test/harness/runtime2/accept.test.ts \
-  test/harness/runtime2/harness.test.ts \
-  test/harness/runtime2/lane.test.ts \
-  test/harness/runtime2/restore.test.ts \
-  test/harness/types.test.ts
-
-cd "$(git rev-parse --show-toplevel)"
-git diff --check
-npm run check
-./test.sh
-```
-
-Report runtime2 source line counts. The synchronized pre-WP02 runtime2 baseline is 967 lines; treat growth above 1,900 source lines as a design review trigger, not a target.
-
-## Stop condition
-
-Stop when:
-
-- acceptance commits exactly once into payload-free `starting` without registry preflight;
-- attachment returns minimal complete projections and open inventory;
-- inspection is a coherent Session-line no-write observation;
-- watch captures detailed state ad hoc on the Session line;
-- state publication and `emitBatch` recipient binding occur in the commit continuation while the mutation never awaits delivery;
-- snapshots and buffered events have no gap or duplicate;
-- required payload corruption faults its consumer;
-- no execution effect or owner is introduced;
-- focused tests, `npm run check`, and full tests pass;
-- final Fable review has no findings.
-
-Do not begin the first real drive package.
+acceptance 只提交一次并写入无 payload starting；attachment 返回最小完整 projection 和 open inventory；inspection 是一致的无写入 Session-line observation；watch 在 Session line 按需读取详细状态；commit continuation 完成 publication 和 recipient binding，mutation 不等待 delivery；snapshot/event 无 gap 或 duplicate；必需 payload corruption 由消费者 fault；不引入 execution effect/owner；focused tests、npm run check、全量测试和最终 Fable review 通过。不要开始第一个真实 drive package。

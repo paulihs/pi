@@ -1,23 +1,23 @@
-# Bounded output publication
+# 有界输出发布
 
-**Status:** the shared adaptive publisher and its `ExecutionEnv` use are implemented. Generic `ToolOutput` integration remains design work.
+**状态：** 共享自适应发布器及其在 `ExecutionEnv` 中的使用已经实现。通用 `ToolOutput` 集成仍属于设计工作。
 
-Depends on landed Chord delta tracking, source-bounded execution output, and scoped storage for durable batches.
+依赖已落地的 Chord delta 跟踪、基于源的有界执行输出，以及用于持久批次的作用域存储。
 
-## 1. Invariant
+## 1. 不变量
 
-> The durable record, what the model sees, and what the UI shows are the same bounded view.
+> 持久记录、模型看到的内容和 UI 显示的内容，是同一个有界视图。
 
-A spill file is not a second view. It is a file inside the execution environment that the model reaches through ordinary file tools.
+溢写文件不是第二个视图，而是执行环境中的文件，模型通过普通文件工具访问它。
 
-Every uncontrolled producer boundary needs two independent bounds:
+每个不受控的生产者边界都需要两个独立的上限：
 
-- **state size:** the latest retained text is capped;
-- **publication:** both encoded bytes and event count are paced.
+- **状态大小：** 最新保留文本有上限；
+- **发布：** 编码后的字节数和事件数量都需要限速。
 
-Delta encoding is complementary. It compresses a published change; it does not cap state or decide when publication occurs.
+Delta 编码是互补机制。它压缩已发布的变更，但不会限制状态大小，也不会决定何时发布。
 
-## 2. Boundaries
+## 2. 边界
 
 ```text
 remote process
@@ -26,100 +26,100 @@ remote process
   -> events + durability + replication
 ```
 
-A publisher instance is required only before a real costly boundary:
+只有在真正昂贵的边界之前才需要发布器实例：
 
-- a physically remote execution environment limits output before transport;
-- `ToolOutput` limits custom tools and downstream event/storage traffic;
-- a colocated environment can feed its bounded updates in process without another serialized transport;
-- custom tools bypass `ExecutionEnv` but cannot bypass `ToolOutput`.
+- 物理上远程的执行环境在传输前限制输出；
+- `ToolOutput` 限制自定义工具以及下游事件/存储流量；
+- 同机环境可以在进程内提供有界更新，无需另一条序列化传输；
+- 自定义工具可以绕过 `ExecutionEnv`，但不能绕过 `ToolOutput`。
 
-The control algorithm is shared. Payload vocabularies differ: Shell uses replace/append/slide/metadata; `ToolOutput` uses Chord operations.
+控制算法是共享的。载荷词汇不同：Shell 使用 replace/append/slide/metadata；`ToolOutput` 使用 Chord 操作。
 
-## 3. Why size or cadence alone is insufficient
+## 3. 为什么仅限制大小或节奏都不够
 
-A fixed 50 KB snapshot is safe per event but not over time. At 100 ms it permits ten complete snapshots per second, approximately 500 KB/s plus envelopes.
+固定的 50 KB 快照单次事件是安全的，但随时间累积并不安全。每 100 ms 发布一次，就允许每秒十个完整快照，约 500 KB/s，另加封装开销。
 
-A byte budget alone also permits excessive tiny events and durable transactions. A minimum interval bounds count; encoded-size debt bounds bandwidth.
+仅限制字节数也会允许过多的微小事件和持久事务。最小间隔限制数量；编码大小产生的欠账限制带宽。
 
-The original handoff incorrectly treated `intervalMs = 100` as 100 emits/s. It is ten emits/s. The fixed interval was still non-adaptive: it delayed small trickles while allowing complete windows at the same frequency.
+原始交接文档错误地把 `intervalMs = 100` 当成每秒发布 100 次。实际上是每秒 10 次。固定间隔仍然不是自适应的：它会延迟小的涓流更新，同时允许完整窗口以相同频率发布。
 
-## 4. Landed adaptive algorithm
+## 4. 已落地的自适应算法
 
-`packages/agent/src/harness/utils/adaptive-publisher.ts` implements:
+`packages/agent/src/harness/utils/adaptive-publisher.ts` 实现：
 
 ```ts
 nextDelayMs = max(globalMinEmitInterval, encodedUpdateBytes * 1000 / globalTargetBytesPerSecond);
 ```
 
-Current harness-global policy:
+当前 Harness 全局策略：
 
 ```ts
 minEmitInterval = 100 ms;
 targetBytesPerSecond = 100 KB/s;
 ```
 
-Behavior:
+行为如下：
 
-1. The first dirty state after idle publishes immediately.
-2. Writes before the next deadline collapse into the latest state.
-3. One trailing timer publishes held state after the deadline.
-4. Completion and correctness boundaries force one bounded publication.
-5. The publisher commits its baseline before consumer delivery, preventing duplicate deltas if a consumer applies and then throws.
+1. 空闲后的第一个脏状态立即发布。
+2. 下一个截止时间之前的写入折叠到最新状态。
+3. 一个尾部定时器会在截止时间后发布暂存状态。
+4. 完成和正确性边界会强制发布一次有界状态。
+5. 发布器在调用消费者前提交基线；即使消费者应用更新后抛错，也不会重复发布 delta。
 
-This is an amortized token bucket with a cap-sized burst. A leading or forced terminal update may exceed the target over a short interval, but sustained encoded bytes converge to the target and sustained event count cannot exceed the minimum-interval floor except for explicit forced correctness writes.
+这是一个带有上限大小突发的摊销令牌桶。前导更新或强制终端更新可能在短时间内超过目标，但持续编码字节数会收敛到目标；持续事件数也不会超过最小间隔所允许的频率，显式强制正确性写入除外。
 
-## 5. Scenario traces
+## 5. 场景轨迹
 
-Assume a 50 KB cap, 100 KB/s target, and 100 ms floor.
+假设上限为 50 KB、目标为 100 KB/s、最小间隔为 100 ms。
 
-### Below cap, completes
+### 未超过上限，正常完成
 
-The initial state publishes immediately. Small appends publish no faster than the floor, and final dirty state is forced. Total encoded text is approximately the produced text.
+初始状态立即发布。小型追加的发布频率不快于最小间隔，并强制发布最终脏状态。编码文本总量约等于生产出的文本量。
 
-### Below cap, trickling
+### 未超过上限，涓流写入
 
-Writes arriving more than 100 ms apart publish immediately because the preceding deadline has already passed. Faster writes collapse into one append per floor interval.
+间隔超过 100 ms 的写入会立即发布，因为之前的截止时间已经过去。更快的写入会按最小间隔折叠为一次追加。
 
-### Above cap, full force
+### 超过上限，全速输出
 
-The retained state never exceeds 50 KB. Complete window turnovers encode as bounded replacements. A roughly 50 KB update buys about 500 ms of silence, yielding approximately two updates and 100 KB per second regardless of raw producer throughput.
+保留状态不会超过 50 KB。完整窗口轮换会编码为有界替换。约 50 KB 的更新可换来约 500 ms 的静默，因此无论原始生产者吞吐量如何，都会稳定在每秒约两次更新、100 KB。
 
-For shell execution, the complete stream goes to a source-local spill under backpressure rather than over the output-update channel.
+对于 shell 执行，完整流会在背压下写入源端本地的溢写文件，而不是经过输出更新通道。
 
-### Above cap, trickling
+### 超过上限，涓流写入
 
-A small tail movement encodes as truncate plus append (Chord) or `slide` (Shell). Its encoded size is small, so the 100 ms floor dominates and output remains responsive. Resending a complete 50 KB snapshot for each tiny slide would be both slower and larger.
+小幅尾部移动会编码为截断加追加（Chord），或编码为 `slide`（Shell）。其编码体积很小，因此主要受 100 ms 最小间隔限制，输出仍保持响应。每次微小滑动都重新发送完整的 50 KB 快照既更慢又更大。
 
-### Burst then silence
+### 突发后静默
 
-The leading state is immediate. Held writes collapse, and one trailing timer publishes the latest residue. There is no polling timer.
+前导状态立即发布。暂存写入会折叠，并由一个尾部定时器发布最新剩余状态。不存在轮询定时器。
 
-### Huge single write
+### 一次超大写入
 
-The producer may already have allocated its input, but the boundary retains and publishes only the configured cap. Shell spill keeps the complete source stream. Arbitrary custom-tool images and structured details still require separate limits.
+生产者可能已经分配了输入，但边界只会保留和发布配置的上限。Shell 溢写会保留完整源流。任意自定义工具的图片和结构化详情仍需要单独设置上限。
 
-## 6. Forced writes
+## 6. 强制写入
 
-These bypass pacing once, while remaining state-size bounded:
+这些写入会绕过节奏控制一次，但仍受状态大小限制：
 
-- command/tool completion;
-- error or abort;
-- a memo and output checkpoint committed atomically;
-- an explicit recovery base/rebase.
+- 命令/工具完成；
+- 错误或中止；
+- memo 与输出检查点以原子方式提交；
+- 显式恢复基线/rebase。
 
-A terminal flush cancels the trailing timer before `tool_end`, preventing a late update for a settled invocation.
+终端刷新会在 `tool_end` 之前取消尾部定时器，避免已结算的调用之后又产生迟到的更新。
 
-## 7. `ToolOutput` application
+## 7. `ToolOutput` 应用
 
-The sink will own one Chord tracker and encoder per invocation. Mutations remain local while publication is blocked; flush-time dirty tracking means held writes collapse without retaining one op per write.
+接收器将为每次调用持有一个 Chord 跟踪器和编码器。发布受阻时变更保留在本地；刷新时的脏跟踪会使暂存写入折叠，而不会每次写入都保留一个操作。
 
-One sink flush feeds the live event and current model-visible state. Durable batches use the same logical flush, encoded as per-stream `WireOp[]`. Periodic `rebase()` bounds recovery replay; a memo correctness flush writes a tagged base batch in the same transaction as the memo.
+一次接收器刷新会同时提供实时事件和当前的模型可见状态。持久批次使用同一个逻辑刷新，并编码为每个流的 `WireOp[]`。定期 `rebase()` 限制恢复重放；memo 正确性刷新会在与 memo 相同的事务中写入带标签的基线批次。
 
-Durable cadence belongs to the sink, not to Shell or bash. Bash's existing two-second checkpoint request remains only as an interim compatibility mechanism until the sink migration.
+持久节奏归接收器所有，而不是归 Shell 或 bash 所有。在接收器迁移完成前，bash 现有的两秒检查点请求仅作为临时兼容机制保留。
 
-## 8. Remaining decisions
+## 8. 剩余决策
 
-- Explicit byte/count rejection policy for images.
-- Bounds for structured details; arbitrary JSON cannot be meaningfully tail-windowed.
-- Whether ordinary durable writes ride every live sink publication initially or use a slower measured cadence. Memo and terminal correctness flushes are not optional.
-- Exact global production values after profiling real remote transport and storage.
+- 图片的显式字节数/数量拒绝策略。
+- 结构化详情的上限；任意 JSON 无法有意义地进行尾部窗口化。
+- 普通持久写入是否一开始就搭载每次实时接收器发布，还是采用更慢且经过测量的节奏。memo 和终端正确性刷新不可省略。
+- 对真实远程传输和存储进行性能分析后确定精确的全局生产值。

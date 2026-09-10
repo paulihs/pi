@@ -1,15 +1,15 @@
-# Typed values and lists
+# 类型化值与列表
 
-This document specifies the mutable storage primitive used by Session, the harness, and applications.
+本文规定 Session、harness 和应用使用的可变持久化存储原语。
 
-The public abstraction is a **bound typed address**:
+公开抽象是绑定的类型化地址：
 
-- `value<T>(namespace, key?)` names one replaceable durable value;
-- `list<T>(namespace, key?)` names one append-only durable list whose elements have type `T`.
+- value<T>(namespace, key?) 表示一个可替换的持久化值；
+- list<T>(namespace, key?) 表示一个追加式持久化列表，元素类型为 T。
 
-The namespace/key pair is bound once when the address is constructed. Every later operation receives only that address. Application code therefore writes:
+namespace/key 在构造地址时绑定一次，后续操作只接收该地址：
 
-```ts
+~~~ts
 const state = value<ApplicationState>("my-app.state");
 const events = list<ApplicationEvent>("my-app.events");
 
@@ -17,76 +17,65 @@ await session.getValue(state, context);
 await session.setValue(state, nextState, context);
 await session.readList(events, { limit: 100 }, context);
 await session.appendList(events, event, context);
-```
+~~~
 
-It does **not** repeatedly pass a second unexplained key:
+调用方不再重复传入第二个含义不明的 key。若应用确实有按 key 区分的实例，应为该实例构造地址：
 
-```ts
-// Not the API.
-await session.readList(events, "another-key", { limit: 100 }, context);
-```
-
-When an application genuinely has keyed instances, it constructs the address for that instance:
-
-```ts
+~~~ts
 const workspaceEvents = (workspaceId: string) =>
   list<ApplicationEvent>("my-app.events", workspaceId);
 
 await session.readList(workspaceEvents("pi"), { limit: 100 }, context);
-```
+~~~
 
-Storage may physically index the address as `(kind, namespace, key)`, but that representation does not leak into each read or write call. Storage, Session, harness code, and applications use the same address vocabulary. There is no global value-type map, dynamic registry, token catalog, or separate application-state storage mechanism.
+存储可以将地址物理索引为 kind、namespace、key，但这种表示不应泄漏到每次读写调用中。Storage、Session、harness 和应用使用同一套地址词汇；不再有全局 value 类型表、动态注册表、token 目录或独立的应用状态存储机制。
 
-## Goals
+## 目标
 
-1. Give one exact durable address one compile-time value type.
-2. Let applications define scalar values and lists without declaration merging or editing a core type map.
-3. Use the same typed addresses and operation names from Storage through Session.
-4. Preserve current scalar replacement semantics.
-5. Append one list element without reading or rewriting existing elements.
-6. Give every list element its own existing session-global transaction `seq`, used for ordering and pagination.
-7. Commit values and list elements atomically with entries and usage.
-8. Produce identical logical behavior on Memory, JSONL, and SQLite.
-9. Keep list reads bounded and explicit.
-10. Keep scalar operation state authoritative; auxiliary lists never select a recovery state.
+1. 一个精确的持久化地址对应一个编译期值类型。
+2. 应用可以定义标量值和列表，不需要 declaration merging，也不需要修改核心类型表。
+3. Storage 到 Session 再到应用使用相同的类型化地址和操作名称。
+4. 保持当前标量替换语义。
+5. 追加一个列表元素时不读取或重写已有元素。
+6. 每个列表元素使用现有的 session 全局事务 seq，并以此排序和分页。
+7. 值、列表元素可以和 entry、usage 原子提交。
+8. Memory、JSONL、SQLite 产生一致的逻辑行为。
+9. 列表读取有明确且有界的范围。
+10. 标量操作状态保持权威；辅助列表不能选择恢复状态。
 
-## Non-goals
+## 非目标
 
-This slice does not define:
+本阶段不定义：
 
-- assistant-frame contents or reduction semantics;
-- tool-progress semantics;
-- runtime validation of trusted in-process values;
-- per-element or per-list byte limits;
-- list truncation or per-element deletion;
-- a generic event log, journal, stream-resumption protocol, or operation reducer;
-- globally registering address objects;
-- exposing raw Session or transaction access to tools.
+- assistant frame 的内容或归约语义；
+- 工具进度语义；
+- 受信任进程内值的运行时校验；
+- 单元素或单列表字节限制；
+- 列表截断或单元素删除；
+- 通用事件日志、journal、流恢复协议或 operation reducer；
+- 全局注册地址对象；
+- 向工具暴露原始 Session 或事务访问。
 
-Consumers own address construction, content limits, cleanup points, fork policy, migration policy, and consumption-time hydration. `assistant-durability.md` defines the first list consumer.
+调用方负责地址构造、内容限制、清理时机、fork 策略、迁移策略和消费时 hydration。assistant-durability.md 定义第一个列表消费者。
 
-## Bound address model
+## 绑定地址模型
 
-```ts
+~~~ts
 declare const storedValueType: unique symbol;
 
 interface StoredAddressBase {
-  /** Stable persisted grouping name. */
   readonly namespace: string;
-  /** Exact member inside that grouping. Empty is legal. */
   readonly key: string;
   readonly kind: "value" | "list";
 }
 
 export interface Value<T> extends StoredAddressBase {
   readonly kind: "value";
-  /** Compile-time only and invariant in T. */
   readonly [storedValueType]?: (value: T) => T;
 }
 
 export interface ValueList<T> extends StoredAddressBase {
   readonly kind: "list";
-  /** T is one element, not the whole list. */
   readonly [storedValueType]?: (value: T) => T;
 }
 
@@ -99,30 +88,30 @@ export function list<T>(namespace: string, key = ""): ValueList<T> {
   validateAddress(namespace, key);
   return Object.freeze({ namespace, key, kind: "list" });
 }
-```
+~~~
 
-The phantom function makes `T` invariant: an address for one type cannot silently widen to another. It has no runtime field.
+phantom function 使 T 保持不变性：一个类型的地址不能静默扩大为另一个类型，运行时不保存该字段。
 
-Rules:
+约束如下：
 
-- `namespace` must be non-empty;
-- namespace `pi` and every `pi.*` namespace are reserved for built-ins by contract;
-- applications that construct a reserved address are defective trusted in-process code; no runtime privilege split, registry, or catalog exists;
-- neither component may contain the Memory backend's internal separator (`\u0000`);
-- an empty key is valid and is the natural address for one application-wide value or list;
-- object identity has no durable meaning;
-- separately constructed addresses with the same `(kind, namespace, key)` identify the same durable location;
-- constructing the same durable location with incompatible TypeScript types is a trusted-programming defect;
-- scalar and list addresses may not share the same `(namespace, key)` in one storage version; violating this is a trusted-programming defect and storage performs no cross-kind collision check;
-- changing an address's namespace, key, kind, or incompatible value shape requires migration.
+- namespace 不能为空；
+- pi 和所有 pi.* namespace 按契约保留给内置地址；
+- 应用构造保留地址属于受信任代码的编程缺陷，不增加运行时权限分层、注册表或目录；
+- 任一组件都不能包含 Memory 后端使用的内部分隔符 U+0000；
+- 空 key 合法，适合表示应用级单值或单列表；
+- 对象身份没有持久化意义；
+- kind、namespace、key 相同但分别构造的地址指向同一持久化位置；
+- 为同一地址使用不兼容的 TypeScript 类型是受信任程序的缺陷；
+- 同一个 storage version 中，标量地址和列表地址不能共用 namespace/key；存储不做跨 kind 冲突检查；
+- 修改 namespace、key、kind 或不兼容的值形状需要迁移。
 
-The two components remain separate rather than concatenated. Dynamic application keys and operation IDs therefore require no escaping convention beyond the storage separator rule.
+两个组件保持分离，不拼接为单一字符串。因此动态应用 key 和 operation ID 除了不能使用存储分隔符外，不需要额外转义约定。
 
-### Exact addresses, not families
+### 精确地址，而不是地址族
 
-An address names one value or one list. Internal code uses small constructors when it has dynamic keys:
+一个地址只表示一个值或一个列表。内部代码遇到动态 key 时使用小型构造器：
 
-```ts
+~~~ts
 export const branchTip = (lane: string) =>
   value<string | null>("pi.branch.tip", lane);
 
@@ -135,7 +124,7 @@ export const operationToolArgs = (
   sourceIndex: number,
 ) => value<Record<string, JsonValue>>(
   "pi.op.tool_args",
-  `${operationId}:${stepId}:${sourceIndex}`,
+  operationId + ":" + stepId + ":" + sourceIndex,
 );
 
 export const pendingAssistantFrames = (
@@ -143,41 +132,41 @@ export const pendingAssistantFrames = (
   responseEntryId: string,
 ) => list<AssistantMessageFrame>(
   "pi.pending.assistant_frame",
-  `${operationId}:${responseEntryId}`,
+  operationId + ":" + responseEntryId,
 );
-```
+~~~
 
-This encapsulates each key grammar at its owner. Call sites receive an already-bound typed address:
+每种 key 语法封装在其所有者中，调用方拿到的是已经绑定的类型化地址：
 
-```ts
+~~~ts
 await reader.getValue(operationState(operationId));
 await reader.readList(pendingAssistantFrames(operationId, responseEntryId), options);
-```
+~~~
 
-### No global value map
+### 不使用全局 value 类型表
 
-Delete the existing global namespace-to-type maps:
+删除现有的全局 namespace-to-type 映射：
 
-```ts
-interface RegisterValues { /* delete */ }
-interface ListRegisterValues { /* delete */ }
-type RegisterNamespace = keyof RegisterValues; // delete
-```
+~~~ts
+interface RegisterValues { /* 删除 */ }
+interface ListRegisterValues { /* 删除 */ }
+type RegisterNamespace = keyof RegisterValues; // 删除
+~~~
 
-A type belongs to an address constructor instead:
+类型归属于地址构造器：
 
-```ts
+~~~ts
 export const applicationState = value<MyApplicationState>("my-app.state");
 export const applicationEvents = list<MyApplicationEvent>("my-app.events");
-```
+~~~
 
-Applications should use a stable, collision-resistant namespace prefix. Namespace `pi` and the complete `pi.*` prefix are reserved for built-ins by contract; similar-looking names such as `pi2` remain legal. The same `value()` and `list()` constructors serve core and application code. Tests assert that every built-in address uses its reserved prefix. There is no runtime privilege split, registry, or catalog.
+应用应使用稳定且不易冲突的 namespace 前缀。pi 和完整的 pi.* 前缀按契约保留给内置地址；类似 pi2 的名称仍然合法。核心代码和应用都使用 value()、list()；测试会断言所有内置地址使用保留前缀。不存在运行时权限分层、注册表或目录。
 
-## Built-in addresses
+## 内置地址
 
-Built-in constructors live together in `packages/agent/src/harness/session/values.ts` and are imported directly by consumers. Representative definitions:
+内置构造器统一位于 packages/agent/src/harness/session/values.ts，由调用方直接导入。典型定义如下：
 
-```ts
+~~~ts
 export const branchTip = (lane: string) =>
   value<string | null>("pi.branch.tip", lane);
 export const laneConfig = (lane: string) =>
@@ -187,7 +176,6 @@ export const laneState = (lane: string) =>
 export const operationResult = (operationId: string) =>
   value<OperationResultRecord>("pi.result", operationId);
 
-/** Used only by scanValues() to enumerate Branch names. */
 export const branchTipInventoryPrefix = () =>
   value<string | null>("pi.branch.tip");
 
@@ -198,62 +186,61 @@ export const operationState = (operationId: string) =>
 export const operationToolArgs = (operationId: string, stepId: string, sourceIndex: number) =>
   value<Record<string, JsonValue>>(
     "pi.op.tool_args",
-    `${operationId}:${stepId}:${sourceIndex}`,
+    operationId + ":" + stepId + ":" + sourceIndex,
   );
 export const operationToolMemo = (operationId: string, invocationId: string, name: string) =>
-  value<JsonValue>("pi.op.tool_memo", `${operationId}:${invocationId}:${name}`);
+  value<JsonValue>("pi.op.tool_memo", operationId + ":" + invocationId + ":" + name);
 export const operationPreparation = (operationId: string, taskId: string) =>
   value<DurableStructuralPreparation>(
     "pi.op.preparation",
-    `${operationId}:${taskId}`,
+    operationId + ":" + taskId,
   );
 
-/** Prefix addresses are exported only for namespace-scoped scanValues(). */
 export const operationToolArgsPrefix = (operationId: string, stepId?: string) =>
   value<Record<string, JsonValue>>(
     "pi.op.tool_args",
-    stepId === undefined ? `${operationId}:` : `${operationId}:${stepId}:`,
+    stepId === undefined ? operationId + ":" : operationId + ":" + stepId + ":",
   );
 export const operationToolMemoPrefix = (operationId: string, invocationId?: string) =>
   value<JsonValue>(
     "pi.op.tool_memo",
-    invocationId === undefined ? `${operationId}:` : `${operationId}:${invocationId}:`,
+    invocationId === undefined ? operationId + ":" : operationId + ":" + invocationId + ":",
   );
 export const operationPreparationPrefix = (operationId: string) =>
-  value<DurableStructuralPreparation>("pi.op.preparation", `${operationId}:`);
+  value<DurableStructuralPreparation>("pi.op.preparation", operationId + ":");
 
 export const pendingEntry = (entryId: string) =>
   value<PendingEntry>("pi.pending.entry", entryId);
 export const pendingToolOutput = (operationId: string, invocationId: string) =>
   value<AgentToolResult<unknown>>(
     "pi.pending.tool_output",
-    `${operationId}:${invocationId}`,
+    operationId + ":" + invocationId,
   );
 export const pendingAssistantFrames = (operationId: string, responseEntryId: string) =>
   list<AssistantMessageFrame>(
     "pi.pending.assistant_frame",
-    `${operationId}:${responseEntryId}`,
+    operationId + ":" + responseEntryId,
   );
 export const pendingToolOutputPrefix = (operationId: string) =>
-  value<AgentToolResult<unknown>>("pi.pending.tool_output", `${operationId}:`);
+  value<AgentToolResult<unknown>>("pi.pending.tool_output", operationId + ":");
 
 export const sessionName = value<string>("pi.session.name");
 export const entryLabel = (entryId: string) => value<string>("pi.entry.label", entryId);
-```
+~~~
 
-`OperationMeta` is immutable acceptance metadata stored at `pi.op.meta`. The process-local `Operation` projection is `{ meta: OperationMeta, state: OperationState }`, assembled from the separate metadata and state values; it is never stored at one address.
+OperationMeta 是存放在 pi.op.meta 的不可变接受元数据。进程内 Operation 投影由独立的 meta 和 state 组装，形状为 { meta: OperationMeta, state: OperationState }，不会合并存放在单一地址。
 
-The five exported scan-prefix constructors are `branchTipInventoryPrefix`, `operationToolArgsPrefix`, `operationToolMemoPrefix`, `operationPreparationPrefix`, and `pendingToolOutputPrefix`. Their addresses are consumed only by `scanValues()`.
+导出的五个 scan 前缀构造器是 branchTipInventoryPrefix、operationToolArgsPrefix、operationToolMemoPrefix、operationPreparationPrefix 和 pendingToolOutputPrefix；它们只能传给 scanValues()。
 
-Applications define their own `value()` and `list()` addresses directly; there is no built-in custom application-state namespace or custom-state API. `AgentHarnessToolInvocation.getMemo()` and `setMemo()` are invocation-fenced capabilities over `operationToolMemo(...)`, not raw Session access. Invocation memos remain operation-owned and are deleted when their tool outcome becomes durable.
+应用直接定义自己的 value() 和 list() 地址，不需要内置的 custom application-state namespace 或 custom-state API。AgentHarnessToolInvocation.getMemo()、setMemo() 是受 invocation fence 约束的 operationToolMemo(...) 能力，而不是原始 Session 访问。invocation memo 归操作所有，在工具结果持久化后删除。
 
-Tests assert that built-in constructors produce the documented kind, namespace, and key grammar. Because constructors may be dynamic, there is no runtime catalog that tries to enumerate every possible address.
+测试应断言内置构造器生成正确的 kind、namespace 和 key 语法。构造器可能使用动态 key，因此不存在枚举所有可能地址的运行时目录。
 
-## Shared read API
+## 共享读取 API
 
-Storage, Session, SessionReader, and SessionMutator use the same read signatures:
+Storage、Session、SessionReader、SessionMutator 使用相同的读取签名：
 
-```ts
+~~~ts
 export interface StoredValue<T> {
   address: Value<T>;
   value: T;
@@ -261,7 +248,6 @@ export interface StoredValue<T> {
 }
 
 export interface ListElement<T> {
-  /** Global transaction-write sequence assigned by storage. */
   seq: number;
   value: T;
 }
@@ -271,32 +257,26 @@ export interface ListCursor {
 }
 
 export interface ListReadOptions {
-  /** Exclusive cursor. */
   cursor?: ListCursor;
-  /** Default: asc. */
   order?: "asc" | "desc";
-  /** Query-page size. Default: 1,000. Values above 10,000 clamp to 10,000. */
   limit?: number;
 }
 
 interface ValueReader {
   getValue<T>(address: Value<T>): Promise<StoredValue<T> | undefined>;
-
-  /** Internal bounded-prefix operation. The address key is interpreted as a prefix. */
   scanValues<T>(prefix: Value<T>): Promise<StoredValue<T>[]>;
-
   readList<T>(
     address: ValueList<T>,
     options?: ListReadOptions,
   ): Promise<ListElement<T>[]>;
 }
-```
+~~~
 
-`scanValues(prefixAddress)` scans scalar addresses with exactly that namespace and keys beginning with the bound key, returning them in key-ascending order. Core call sites use only the exported prefix constructors above so raw namespace/key grammar stays in `session/values.ts`. Prefix addresses are passed only to `scanValues()`, never to exact get/set/delete operations. There is no unrestricted cross-namespace dump. Ordinary application reads use exact addresses.
+scanValues(prefixAddress) 扫描 namespace 完全相同且 key 以绑定 key 开头的标量地址，按 key 升序返回。核心调用点只能使用上述导出的前缀构造器；原始 namespace/key 语法保留在 session/values.ts。前缀地址只能传给 scanValues()，不能用于精确的 get/set/delete。不存在不受限的跨 namespace dump，普通应用读取使用精确地址。
 
-`Session` exposes direct one-transition writes using the same addresses:
+Session 暴露使用同一地址的单转换写入：
 
-```ts
+~~~ts
 interface Session extends ValueReader {
   setValue<T>(
     address: Value<T>,
@@ -311,17 +291,17 @@ interface Session extends ValueReader {
   ): Promise<void>;
   deleteList<T>(address: ValueList<T>, context: Context): Promise<void>;
 }
-```
+~~~
 
-Purpose-specific helpers such as `getName()`, `setName()`, `getLabel()`, and `setLabel()` may remain thin wrappers over built-in addresses. Applications define and use their own scalar/list addresses directly.
+getName()、setName()、getLabel()、setLabel() 等用途明确的 helper 可以保留为内置地址的薄封装。应用直接定义和使用自己的标量/列表地址。
 
-`SessionMutator` remains a read capability plus one atomic `commit(writes)`. It does not expose direct `setValue()`/`appendList()` methods that would consume its only commit separately; callers construct a typed write array and commit it together.
+SessionMutator 仍然是读取能力加一个原子 commit(writes)。它不暴露会分别消耗唯一提交机会的直接 setValue()/appendList()；调用方构造类型化写入数组后一次提交。
 
-## Typed transaction writes
+## 类型化事务写入
 
-Writes are constructed through typed helpers. Entry and usage constructors hide their storage discriminants; value/list erasure happens only after the helper has checked the address/value type relationship:
+写入通过类型化 helper 构造。entry 和 usage 构造器隐藏存储 discriminant；value/list 只有在 helper 检查地址和值类型关系之后才擦除类型：
 
-```ts
+~~~ts
 interface EntryWrite {
   kind: "entry";
   entry: NewEntry;
@@ -368,64 +348,64 @@ export function setValue<T>(address: Value<T>, next: NoInfer<T>): ValueSetWrite;
 export function deleteValue<T>(address: Value<T>): ValueDeleteWrite;
 export function appendList<T>(address: ValueList<T>, element: NoInfer<T>): ListAppendWrite;
 export function deleteList<T>(address: ValueList<T>): ListDeleteWrite;
-```
+~~~
 
-`NoInfer<T>` makes the address authoritative. TypeScript must not infer a wider `T` from an incompatible write value.
+NoInfer<T> 让地址类型保持权威，避免 TypeScript 从不兼容的写入值推导出更宽的 T。
 
-`Write` includes all six helper return types. One transaction may mix every write kind atomically. Harness and application code use the helpers rather than manually constructing storage write shapes.
+Write 包含六种 helper 返回类型，一个事务可以把它们与 entry、usage 混合并原子提交。harness 和应用代码应使用 helper，不要手写存储写入形状。
 
-The direct Session methods and transaction helpers intentionally use the same operation names. One performs and commits a single Session mutation; the other constructs a write for an explicitly composed transaction.
+Session 直接写入和事务 helper 有意使用相同操作名：前者执行并提交一次 Session mutation，后者构造一个可显式组合的事务写入。
 
-## Scalar semantics
+## 标量语义
 
-For one `Value<T>` address:
+对一个 Value<T> 地址：
 
-- `setValue` replaces the current value;
-- `deleteValue` removes it;
-- deleting an absent value is a no-op;
-- set after delete recreates it;
-- there is no retained value history;
-- the current value records the `seq` of its latest set;
-- a failed transaction exposes neither the scalar write nor any sibling write.
+- setValue 替换当前值；
+- deleteValue 删除它；
+- 删除不存在的值是 no-op；
+- 删除后 set 可以重新创建；
+- 不保留值历史；
+- 当前值记录最近一次 set 的 seq；
+- 事务失败时，标量写入和同事务的其他写入都不可见。
 
-## List semantics
+## 列表语义
 
-One append write carries one immutable element. A transaction appending several elements contains several append writes. Every write receives its existing globally increasing transaction sequence:
+一次 append 写入携带一个不可变元素；在一个事务中追加多个元素就包含多个 append 写入。每次写入都获得全局递增的事务序号：
 
-```text
+~~~text
 TX[
   appendList(frames, A),       // seq 41
   setValue(operationState, X), // seq 42
   appendList(frames, B),       // seq 43
 ]
-```
+~~~
 
-Reading `frames` returns `A`, then `B`. Gaps from unrelated writes are expected. A list element's `seq` is session-global and unique to that committed write; it is an ordering/cursor identity, not an application domain ID. Applications that need domain identity include it in `T`.
+读取 frames 返回 A、B。与其他写入交错产生的 seq 间隔是正常的。列表元素的 seq 是 session 全局且唯一的提交写入序号，用于排序和 cursor，不是应用领域 ID；需要领域身份时应把它放入 T。
 
-Rules:
+规则：
 
-- append never reads existing elements;
-- an element is immutable after commit;
-- `deleteList(address)` removes every element at that exact address;
-- deleting an absent list is a no-op;
-- delete followed by append in one transaction creates a fresh list atomically;
-- there is no per-element update, delete, insertion, or truncation;
-- all validation and serialization required to admit a transaction completes before Memory state changes;
-- a failed transaction exposes none of its list or non-list writes.
+- append 不读取已有元素；
+- 元素提交后不可变；
+- deleteList(address) 删除该精确地址的所有元素；
+- 删除不存在的列表是 no-op；
+- 同一事务中 delete 后 append 会原子地产生新列表；
+- 不支持单元素 update、delete、插入或截断；
+- 事务进入 Memory 状态前必须完成所有验证和序列化；
+- 事务失败时，其列表和非列表写入都不可见。
 
-“Append-only” describes elements while the list exists. Whole-list deletion is lifecycle cleanup, not element mutation.
+“追加式”描述列表存在期间的元素行为；整表删除属于生命周期清理，不是元素修改。
 
-### List reads
+### 列表读取
 
-- ascending reads return `seq > cursor.seq`;
-- descending reads return `seq < cursor.seq`;
-- results are ordered according to `order` before `limit` is applied;
-- absent and empty both return `[]`;
-- callers continue with the last returned element's `seq`;
-- an empty page ends iteration;
-- `limit` is only the query-page size: it must be a positive safe integer, defaults to 1,000, and values above 10,000 clamp to 10,000; it never limits total list length or bytes.
+- 升序读取返回 seq > cursor.seq；
+- 降序读取返回 seq < cursor.seq；
+- 先按 order 排序，再应用 limit；
+- 不存在和空列表都返回 []；
+- 调用方使用最后一个元素的 seq 继续读取；
+- 空页表示迭代结束；
+- limit 只限制查询页大小，必须是正的安全整数，默认 1000，大于 10000 时截断为 10000；它不限制列表总长度或字节数。
 
-```ts
+~~~ts
 let cursor: ListCursor | undefined;
 while (true) {
   const page = await reader.readList(events, { cursor, order: "asc", limit: 100 });
@@ -433,98 +413,87 @@ while (true) {
   consume(page);
   cursor = { seq: page[page.length - 1]!.seq };
 }
-```
+~~~
 
-A cursor is a sequence filter, not a snapshot or list-incarnation token. Concurrent later appends may appear on later ascending pages. Whole-list deletion may make a cursor stale; reads simply apply its sequence comparison to currently surviving elements.
+cursor 只是序列过滤器，不是 snapshot 或 list incarnation token。并发追加可能在后续升序页出现。整表删除可能使 cursor 变旧；读取仍只对当前存活元素应用序列比较。
 
-Do not add an unbounded “read the whole list” helper.
+不要增加无界的“读取整个列表” helper。
 
 ## Assistant partial frames
 
-Assistant partial durability is the first built-in list consumer:
+assistant partial durability 是第一个内置列表消费者：
 
-```ts
+~~~ts
 const frames = pendingAssistantFrames(operationId, responseEntryId);
-```
+~~~
 
-`AssistantMessageFrame`, `AssistantMessageFrameEncoder`, and `reduceAssistantMessageFrames()` come from `@earendil-works/pi-ai`. Do not define a second frame codec or reducer.
+AssistantMessageFrame、AssistantMessageFrameEncoder 和 reduceAssistantMessageFrames() 来自 @earendil-works/pi-ai，不要定义第二套 frame codec 或 reducer。
 
-For every convertible non-terminal provider event, the assistant procedure:
+对于每个可转换的非终止 provider event，assistant procedure 执行：
 
-```text
-convert event to frame
-→ synchronously enqueue appendList(frames, frame) on the Session mutation line
-→ attach the ordinary harness-fault observer to that returned promise
-→ replace the process-local latestFrameWrite reference
-→ emit and await the existing message event
-→ consume the next provider event
-```
+~~~text
+event 转换为 frame
+→ 在 Session mutation line 上同步排队 appendList(frames, frame)
+→ 给返回 promise 绑定普通 harness fault observer
+→ 替换进程内 latestFrameWrite 引用
+→ emit 并等待现有 message event
+→ 消费下一个 provider event
+~~~
 
-The provider loop does not await storage for every frame. Synchronous enqueue preserves provider-event order. Replacing the latest-promise reference never leaves an earlier rejection unobserved because every promise receives the fault observer. Bounded output bounds queued work. On stream settlement, the procedure stops frame admission and awaits the latest append promise before `after_response`; Session mutation FIFO means that completion implies every earlier append completed. There is no timer, batcher, coalescer, or flush API.
+provider loop 不会等待每个 frame 的存储完成；同步入队保持 provider event 顺序。每个 promise 都绑定 fault observer，因此替换 latest promise 不会使更早的 rejection 无人观察。输出有界也会限制排队工作。流结算时停止接受 frame，等待最新 append promise，然后进入 after_response；Session mutation FIFO 使该完成意味着所有更早的 append 都已完成。不使用 timer、batcher、coalescer 或 flush API。
 
-Scalar assistant `effect_pending` remains authoritative. Each append verifies that the same operation, attempt, and response ID still own the lane when its mutation executes. Frames never prove request admission, completion, success, or failure.
+标量 assistant effect_pending 仍然是权威状态。每次 append 在 mutation 执行时校验当前 lane 仍由同一 operation、attempt 和 response ID 所有。frame 不能证明请求已接受、完成、成功或失败。
 
-Final or synthetic assistant settlement deletes the exact list atomically with its immutable response, usage, Branch tip, and next scalar state:
+最终或合成的 assistant 结算会将精确列表和 immutable response、usage、Branch tip、下一个标量状态原子删除/写入：
 
-```text
+~~~text
 TX[
   insert final assistant entry,
   insert usage,
   deleteList(frames),
   setValue(operationState(operationId), nextState),
 ]
-```
+~~~
 
-`assistant-durability.md` defines frame conversion, unknown-outcome synthesis, cancellation, deferred polling, snapshots, and event ordering.
+assistant-durability.md 规定 frame 转换、未知结果合成、取消、deferred polling、snapshot 和事件顺序。
 
-## Restore policy
+## 恢复策略
 
-Scalar operation state remains the sole restart authority:
+标量 operation state 是唯一的重启权威来源：
 
-1. construct the trusted lane/operation projection from required scalar values;
-2. trust committed typed values rather than auditing every referenced payload or phase relationship;
-3. when a procedure or snapshot consumes auxiliary state, derive its exact bound address from current typed scalar state;
-4. hydrate only the bounded scalar values or list pages that consumer requires.
+1. 从必需的标量值构造受信任的 lane/operation 投影；
+2. 信任已提交的类型化值，不审计所有被引用的 payload 或阶段关系；
+3. procedure 或 snapshot 需要辅助状态时，从当前类型化标量状态推导精确地址；
+4. 只 hydration 当前消费者需要的有界标量值或列表页。
 
-A missing auxiliary list is legal unless its consumer explicitly requires an element. List contents never prove that an external effect completed. Live mutations still verify current operation, phase, attempt, and reserved identity as concurrency fencing; that is not restore validation.
+缺失的辅助列表是合法状态，除非消费者明确要求某个元素。列表内容不能证明外部 effect 已完成。在线 mutation 仍需校验当前 operation、phase、attempt 和保留 identity；这属于并发 fence，不是恢复校验。
 
-Base restore does not enumerate lists. For assistant frames, snapshot or recovery derives `pendingAssistantFrames(operationId, responseEntryId)` only while consuming a typed assistant/deferred `effect_pending` state.
+基础恢复不枚举列表。对 assistant frame，只有在消费类型化的 assistant/deferred effect_pending 状态时，才根据 operationId 和 responseEntryId 推导 pendingAssistantFrames 地址。
 
-Each list consumer defines:
+每个列表消费者必须定义地址语法、元素和总字节上限、分页/hydration 预算、清理转换、fork 和迁移策略。
 
-- address grammar;
-- element and total-byte bounds;
-- page/hydration budget;
-- cleanup transitions;
-- fork and migration policy.
+## Memory 后端
 
-## Memory backend
+Memory 可以分别维护当前值和列表元素：
 
-Memory may keep separate maps for current values and list elements:
-
-```ts
+~~~ts
 const scalarValues = new Map<string, StoredValue<unknown>>();
 const listValues = new Map<string, ListElement<unknown>[]>();
 
 function physicalKey(address: StoredAddressBase): string {
-  return `${address.namespace}\u0000${address.key}`;
+  return address.namespace + "\u0000" + address.key;
 }
-```
+~~~
 
-- scalar set replaces one map value;
-- scalar delete removes it;
-- list append pushes the already-sequenced element;
-- list delete removes the complete array;
-- list read filters by exclusive cursor and slices to the validated limit;
-- transaction preparation completes before entries, values, lists, usage, or stats mutate.
+标量 set 替换 Map 值，标量 delete 删除它，list append 追加已分配序号的元素，list delete 删除完整数组，list read 按 exclusive cursor 过滤并截取到已验证的 limit。事务准备必须在 entries、values、lists、usage 和 stats 改变前完成。
 
-Storage snapshots used by JSONL/fork tooling include current scalar values and surviving list elements with original sequence numbers.
+JSONL/fork 工具使用的 snapshot 包含当前标量值和保留原始序号的列表元素。
 
-## SQLite backend
+## SQLite 后端
 
-The logical schema has one current-value table and one list-element table:
+逻辑 schema 有一个当前值表和一个列表元素表：
 
-```sql
+~~~sql
 CREATE TABLE scalar_values (
   namespace TEXT NOT NULL,
   key       TEXT NOT NULL,
@@ -540,13 +509,13 @@ CREATE TABLE list_values (
   value     TEXT    NOT NULL,
   PRIMARY KEY (namespace, key, seq)
 ) WITHOUT ROWID;
-```
+~~~
 
-WP01 replaces the unfinished format-4 schema in place: edit `sqlite/migrations/001_initial.sql`, rename the physical `registers` table to `scalar_values`, add `list_values`, and keep `SQLITE_STORAGE_VERSION = 1`. There is no migration runner in this WIP implementation, and pre-WP01 SQLite files are unsupported. Do not add migration machinery in this package.
+WP01 原地替换未完成的 format-4 schema：编辑 sqlite/migrations/001_initial.sql，将物理 registers 表改名为 scalar_values，增加 list_values，并保持 SQLITE_STORAGE_VERSION = 1。不增加 migration runner；WP01 之前的 SQLite 文件不支持。
 
-List operations:
+列表操作：
 
-```sql
+~~~sql
 INSERT INTO list_values(namespace, key, seq, value) VALUES (?, ?, ?, ?);
 
 SELECT seq, value FROM list_values
@@ -558,178 +527,121 @@ WHERE namespace = ? AND key = ? AND seq < ?
 ORDER BY seq DESC LIMIT ?;
 
 DELETE FROM list_values WHERE namespace = ? AND key = ?;
-```
+~~~
 
-For a missing cursor, omit the sequence predicate. Every write participates in the existing `BEGIN IMMEDIATE` transaction; writable Session ownership belongs to the host lifecycle, not SQLite storage. Assert with `EXPLAIN QUERY PLAN` that paging uses the primary key and no temporary sort.
+每个写入都参与既有 BEGIN IMMEDIATE 事务。可写 Session 的所有权属于 host 生命周期，而不是 SQLite 存储。用 EXPLAIN QUERY PLAN 断言分页使用主键且不产生临时排序。
 
-## JSONL backend
+## JSONL 后端
 
-Logical records carry the bound address's physical components:
+逻辑记录携带绑定地址的物理组件：
 
-```jsonl
+~~~jsonl
 {"kind":"list","op":"append","seq":41,"namespace":"pi.pending.assistant_frame","key":"O:R","value":{"type":"text_delta","contentIndex":0,"delta":"hi"}}
 {"kind":"list","op":"delete","seq":52,"namespace":"pi.pending.assistant_frame","key":"O:R"}
-```
+~~~
 
-Scalar records use `kind:"value"` with `op:"set"|"delete"`. WP01 keeps JSONL format 4 and storage version 1 but replaces the unfinished record spelling in place; pre-WP01 format-4 files are unsupported and no legacy `kind:"register"` decoder remains.
+标量记录使用 kind:"value" 和 op:"set"|"delete"。WP01 保持 JSONL format 4 和 storage version 1，但原地替换未完成的记录写法；WP01 之前的 format-4 文件不支持，也不保留 legacy kind:"register" decoder。
 
-Replay folds records into the Memory state:
+重放将记录折叠到 Memory 状态：标量 set 替换当前地址，标量 delete 删除它，list append 增加 { seq, value }，list delete 删除完整列表。
 
-- scalar set replaces the current address;
-- scalar delete removes it;
-- list append adds `{ seq, value }`;
-- list delete removes the complete list.
-
-A transaction remains one physical JSONL line, using an array for multiple writes. Torn-tail handling therefore remains atomic without new framing.
+一个事务仍然使用一行物理 JSONL，多写事务用数组表示。尾部截断因此仍保持原子性，不需要新的 framing。
 
 ### Snapshot compaction
 
-Compaction writes every surviving list element with its original `seq`, merged in sequence order with surviving entries, scalar values, and usage rows. Do not collapse one live list into a synthetic element or assign new sequence numbers; either change breaks cursors and backend equivalence.
+压缩将所有仍存活的列表元素以原始 seq 写出，与存活的 entry、标量值和 usage row 按序合并。不能把一个存活列表压缩成合成元素，也不能分配新 seq；否则会破坏 cursor 和后端一致性。
 
-Deleted lists produce no snapshot records. Snapshot rewrites persist `nextSeq` in the format-4 header so dropping the latest delete cannot permit sequence reuse; ordinary append-only files may omit that field and derive it from replayed writes.
+已删除列表不写入 snapshot。snapshot rewrite 在 format-4 header 中持久化 nextSeq，防止丢失最近 delete 后复用序号；普通追加文件可以省略该字段并从重放记录推导。
 
-## Forks and rewrites
+## Fork 与重写
 
-Fork and precise-rewrite code decides policy per concrete address grammar:
+fork 和精确重写按具体地址语法决定策略：
 
-- operation-owned `pi.op.*` scalar values are not copied into an idle fork;
-- immutable `pi.result` operation records are not copied by forks;
-- `pi.pending.entry`, `pi.pending.tool_output`, and `pi.pending.assistant_frame` values/lists are not copied;
-- lane and semantic session values follow their existing scope rules;
-- application-defined values/lists are not copied by the generic fork; a consuming feature must add an explicit address-specific policy before relying on copied application state.
+- operation-owned pi.op.* 标量值不复制到 idle fork；
+- immutable pi.result operation record 不由 fork 复制；
+- pi.pending.entry、pi.pending.tool_output、pi.pending.assistant_frame 值/列表不复制；
+- lane 和语义 session 值遵循现有 scope 规则；
+- 通用 fork 不复制应用定义的值/列表；使用方必须先增加明确的地址策略。
 
-A precise rewrite retaining list elements preserves their `seq` values unless it explicitly remaps the entire destination sequence space.
+精确重写保留列表元素时，除非显式重映射整个目标序列空间，否则保留原 seq。
 
-## Schema evolution
+## Schema 演进
 
-A bound address's namespace, key grammar, kind, and value type are durable schema:
+绑定地址的 namespace、key 语法、kind 和值类型构成持久化 schema：
 
-- changing namespace or key grammar requires explicit address migration;
-- changing scalar to list or list to scalar requires explicit migration;
-- storage never infers or coerces kind from observed records;
-- changing TypeScript value shape requires total value migration when old stored values are incompatible;
-- a list migration pages elements in sequence order and either maps them while preserving `seq` or deletes the complete list;
-- a migration must not load an unbounded logical list at once.
+- 修改 namespace 或 key 语法需要明确的地址迁移；
+- 标量与列表互转需要明确迁移；
+- 存储不会根据观察到的记录推断或强制转换 kind；
+- TypeScript 值形状变化且旧值不兼容时，需要完整值迁移；
+- 列表迁移按 seq 顺序分页，并选择保留 seq 映射或删除完整列表；
+- 迁移不能一次性加载无界列表。
 
-Adding generic list storage replaces the current WIP backend schema in place. Constructing a new application address with no persisted value requires no migration.
+增加通用列表存储会原地替换当前 WIP 后端 schema。构造没有持久值的新应用地址不需要迁移。
 
-## Instrumentation and telemetry
+## Instrumentation 与 telemetry
 
-The instrumented storage decorator exposes the address-based read API and records committed erased writes in exact transaction order.
+instrumented storage decorator 暴露基于地址的读取 API，并按精确事务顺序记录擦除类型后的提交写入。
 
-Telemetry session-write item kinds distinguish scalar-value writes from list writes. Namespace/key names may be attributes when the telemetry schema permits them, but values, assistant frames, prompts, and tool output never enter telemetry.
+telemetry 的 session-write item kind 区分 scalar-value 写入和 list 写入。namespace/key 只有在 telemetry schema 允许时才作为 attribute；值、assistant frame、prompt 和工具输出绝不进入 telemetry。
 
-Append-path tests prove that no `readList` call occurs before append commit. Frame-persistence promises always receive the harness fault observer, even when an earlier promise is no longer the latest settlement-order reference.
+append 路径测试证明 append commit 前不会调用 readList。即使早期 promise 不再是最新的 settlement-order 引用，每个 frame-persistence promise 仍必须绑定 harness fault observer。
 
-## Invariants
+## 不变量
 
-1. One bound address has one stable namespace/key/kind and one trusted value type in a storage version.
-2. Address object identity has no durable meaning.
-3. Namespace `pi` and every `pi.*` are reserved by contract; every built-in namespace starts with `pi.`, and application use is a trusted-programming defect.
-4. Exactly five built-in prefix constructors encapsulate Branch inventory and operation cleanup grammar; their results are consumed only by namespace-scoped `scanValues()`.
-5. Scalar and list addresses must not occupy the same physical location; this is a trusted-programming rule, not a runtime cross-kind collision check.
-6. Typed reads and helper-constructed writes preserve `T`.
-7. Scalar helpers reject list addresses; list helpers reject scalar addresses.
-8. A Session/Storage operation never requires a second key after address construction.
-9. Every list element is immutable and carries its globally unique committed write `seq`.
-10. Elements at one list address are returned in sequence order on every backend.
-11. Append performs no read of the target list.
-12. Scalar/list writes are atomic with entries and usage in the same transaction.
-13. Whole-list delete leaves no elements at that address.
-14. Missing and empty lists both read as `[]`.
-15. Base restore depends only on required scalar state and never enumerates auxiliary lists.
-16. Auxiliary lists never establish effect completion or select a restart state.
-17. JSONL compaction preserves surviving element sequences.
-18. Terminal cleanup leaves no operation-owned scalar values or lists.
+1. 一个绑定地址在一个 storage version 内具有稳定的 namespace/key/kind 和受信任值类型。
+2. 地址对象 identity 没有持久化意义。
+3. pi 和所有 pi.* 按契约保留；所有内置 namespace 以 pi. 开头，应用使用保留空间属于受信任代码缺陷。
+4. 五个内置 prefix constructor 封装 Branch inventory 和 operation cleanup 语法，结果只能传给 namespace-scoped scanValues()。
+5. 标量和列表不能占用同一物理位置；这是受信任代码规则，不是运行时跨 kind 冲突检查。
+6. 类型化读取和 helper 构造的写入保持 T。
+7. 标量 helper 拒绝列表地址，列表 helper 拒绝标量地址。
+8. 地址构造后，Session/Storage 操作不再需要第二个 key。
+9. 每个列表元素不可变，并携带全局唯一的提交写入 seq。
+10. 同一列表地址的元素在所有后端按 seq 返回。
+11. append 不读取目标列表。
+12. 标量/列表写入可以与 entry、usage 在同一事务中原子提交。
+13. 整表删除后该地址没有残留元素。
+14. 缺失和空列表都读取为 []。
+15. 基础恢复只依赖必需标量状态，从不枚举辅助列表。
+16. 辅助列表不能建立 effect 完成事实，也不能选择重启状态。
+17. JSONL 压缩保留存活元素的 seq。
+18. terminal cleanup 不留下 operation-owned 标量值或列表。
 
-## Required tests
+## 必需测试
 
-### Address typing and identity
+### 地址类型与身份
 
-- `value<T>()` and `list<T>()` preserve their declared `T` invariantly;
-- scalar reads infer the bound address's value type;
-- list reads infer its element type;
-- `setValue` rejects an incompatible value at compile time;
-- `appendList` rejects an incompatible element at compile time;
-- scalar helpers reject list addresses and list helpers reject scalar addresses;
-- independently constructed equal addresses access the same durable location;
-- incompatible definitions of one physical address are documented/tested as a programming defect;
-- empty keys work, while empty namespaces and separator-containing components reject;
-- core and application code use the same `value()` and `list()` constructors, with no private constructor, privilege token, registry, or catalog;
-- built-in address constructors produce exact `pi.branch.tip`, `pi.lane.*`, `pi.op.*`, `pi.pending.*`, `pi.session.name`, and `pi.entry.label` namespace/key/kind triples;
-- every built-in namespace starts with `pi.`, while application fixtures use non-reserved namespaces;
-- `branchTipInventoryPrefix()` binds the empty-key `pi.branch.tip` inventory prefix and is used only to enumerate Branches through `scanValues`;
-- tool-args prefixes cover one operation and optionally one step, tool-memo prefixes cover one operation and optionally one invocation, preparation and tool-output prefixes cover exactly one operation;
-- each prefix constructor result is used only by `scanValues`, and no inventory or cleanup call constructs a raw reserved namespace;
-- application addresses work without declaration merging or core catalogs;
-- no Storage or Session operation accepts an additional key argument.
+验证 value<T>()、list<T>() 保持声明的 T；标量/列表读取推导正确元素类型；setValue 和 appendList 在编译期拒绝不兼容类型；标量 helper 与列表 helper 互相拒绝错误地址；相同三元组的独立地址访问同一位置；空 key 合法、空 namespace 和包含分隔符的组件被拒绝。
 
-### Scalar regression
+验证核心代码和应用使用同一套 value()/list()，没有私有构造器、权限 token、注册表或目录；内置构造器生成精确的 pi.branch.tip、pi.lane.*、pi.op.*、pi.pending.*、pi.session.name、pi.entry.label namespace/key/kind；所有内置 namespace 以 pi. 开头，应用 fixture 使用非保留 namespace。
 
-- set/get/delete/recreate behavior is unchanged;
-- replacement retains only the latest logical value and latest set `seq`;
-- typed write helpers preserve mixed transaction order;
-- prefix scans interpret the bound address key as a prefix and remain namespace-scoped;
-- new scalar JSONL/SQLite files use only the value/list schema; pre-WP01 WIP files are explicitly unsupported.
+验证五个 prefix constructor 只被 scanValues 使用，应用无需 declaration merging 或核心 catalog；任何 Storage/Session 操作都不接受构造地址后的额外 key。
 
-### List conformance
+### 标量回归
 
-Extend the shared backend conformance suite:
+验证 set/get/delete/recreate、替换只保留最新值和 seq、混合事务顺序、namespace-scoped prefix scan；新 JSONL/SQLite 文件只使用 value/list schema，并明确不支持 WP01 之前的 WIP 文件。
 
-- append one element and page it;
-- multiple appends to one address in one transaction;
-- appends separated by unrelated writes preserve per-list order;
-- every element receives its own global write `seq`;
-- ascending and descending exclusive cursors;
-- default, explicit, invalid, and capped limits;
-- absent list returns `[]`;
-- whole-list delete and delete of absent list;
-- delete followed by append in one transaction;
-- rollback when a later write is invalid;
-- atomic list + entry + usage + scalar transaction;
-- identical pages and cursors on Memory, JSONL, and SQLite;
-- JSONL torn multi-write transaction exposes no list element;
-- JSONL replay and compaction preserve cursors;
-- SQLite paging uses the primary key without temporary sorting;
-- append performs no list read;
-- base restore constructs trusted scalar projection without list reads, followed by bounded consumption-time hydration;
-- close rejects later reads and honors already-admitted commits.
+### 列表一致性
 
-### Application surface
+扩展共享后端 conformance suite，覆盖单元素追加与分页、同事务多次追加、与无关写入交错后的顺序、全局 write seq、升降序 exclusive cursor、默认/显式/非法/上限 limit、缺失列表、整表删除、delete 后 append、后续写入无效时的 rollback、list+entry+usage+scalar 原子事务、Memory/JSONL/SQLite 相同页面和 cursor、JSONL 尾部截断、重放和压缩、SQLite 主键分页、append 无 list read、基础恢复无 list read、close 后行为。
 
-- an application-wide scalar value requires no extra key at get/set;
-- an application-wide list requires no extra key at read/append;
-- an application can construct dynamic per-workspace addresses explicitly;
-- Storage and Session accept the same address objects and infer the same types;
-- direct Session writes serialize and commit once;
-- explicit `Session.mutate()` can atomically combine typed value/list writes with entries and usage.
+### 应用接口
 
-### Assistant-frame integration — deferred beyond WP01
+验证应用级标量和列表不需要额外 key；应用可以显式构造 workspace 地址；Storage 和 Session 接受同一地址并推导同一类型；直接 Session 写入只序列化和提交一次；Session.mutate() 能把类型化值/列表写入与 entry、usage 原子组合。
 
-- every converted non-terminal frame appends under the exact bound effect-pending response address;
-- terminal `done`/`error` events append nothing;
-- appends enqueue synchronously without provider backpressure;
-- every frame-write promise has an observed fault path;
-- only the latest promise reference is retained for settlement ordering;
-- awaiting the latest promise implies every earlier append completed;
-- reduced pages reconstruct the same partial message as uninterrupted streaming;
-- missing list restores as no durable partial;
-- final/synthetic settlement atomically deletes the frame list;
-- unknown-effect recovery reads only the bounded list derived from current scalar state;
-- external finalization deletes the operation-owned list;
-- idle forks contain no frame list;
-- backend byte growth is append-linear rather than repeated-snapshot growth.
+### Assistant frame 集成，延期到 WP01 之后
 
-## Implementation map
+覆盖非终止 frame 的精确地址、done/error 不追加、同步入队且不产生 provider backpressure、每个 promise 都有 fault 路径、只保留 latest promise、等待 latest 即意味着所有更早追加完成、分页可还原相同 partial message、缺失列表恢复为空、最终/合成结算原子删除列表、未知 effect 恢复只读取当前标量状态推导的有界列表、external finalization 删除 operation-owned 列表、idle fork 不含 frame 列表，以及增长从重复 snapshot 变为追加线性。
 
-Expected primary changes:
+## 实现地图
 
-- replace `session/registers.ts` with `packages/agent/src/harness/session/values.ts` containing addresses, constructors, typed write helpers, and built-in address constructors;
-- remove `RegisterValues`, namespace unions, register token types, and raw namespace/key read signatures from `session/types.ts`;
-- expose `ValueReader` through Storage, SessionReader, SessionMutator, and Session;
-- expose direct application scalar/list methods on Session using bound addresses;
-- update Memory state, JSONL codec/storage, snapshots, fork/rewrite code, instrumentation, and conformance suites;
-- replace SQLite's unfinished initial schema in place with `scalar_values` and `list_values`; keep storage version 1 and add no migration runner;
-- update telemetry schema sources and regenerate `telemetry-schema.md`; do not edit that generated file manually.
+预计主要改动：
 
-WP01 stops after generic addresses/storage and projection-only restore coverage. `assistant-durability.md` specifies the later consuming lifecycle; assistant execution, deferred polling, recovery, snapshot hydration, memo/checkpoint capabilities, and operation cleanup land only with their runtime work packages.
+- 用 packages/agent/src/harness/session/values.ts 替换 session/registers.ts，集中放置地址、构造器、类型化写入 helper 和内置地址构造器；
+- 从 session/types.ts 删除 RegisterValues、namespace union、register token 和原始 namespace/key 读取签名；
+- 让 Storage、SessionReader、SessionMutator、Session 暴露 ValueReader；
+- Session 直接暴露基于绑定地址的应用标量/列表方法；
+- 更新 Memory 状态、JSONL codec/storage、snapshot、fork/rewrite、instrumentation 和 conformance suite；
+- 用 scalar_values 与 list_values 原地替换 SQLite 未完成的初始 schema，保持 storage version 1，不增加 migration runner；
+- 更新 telemetry schema source 并重新生成 telemetry-schema.md，不手工修改生成文件。
+
+WP01 在通用地址、存储和 projection-only restore 覆盖完成后停止。assistant-durability.md 定义后续消费生命周期；assistant execution、deferred polling、recovery、snapshot hydration、memo/checkpoint capability 和 operation cleanup 随后续 runtime work package 实现。

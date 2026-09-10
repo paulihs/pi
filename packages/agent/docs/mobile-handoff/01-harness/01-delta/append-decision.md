@@ -1,12 +1,12 @@
-# Decision: no explicit text append/truncate API
+# 决策：不提供显式文本追加/截断 API
 
-**Status: closed.** Do not add `appendText`, explicit truncate, a text-specific dirty-node kind, or proxy-to-tracker lookup machinery.
+**状态：已关闭。** 不要添加 `appendText`、显式截断、文本专用的脏节点类型或代理到跟踪器的查找机制。
 
-## Why it was considered
+## 为什么曾考虑它
 
-The tracker marks dirty paths and compares them with its accepted baseline at `flush()`. For a growing or rolling string, confirming the relationship can scan the retained string even though the producer already knows it appended or evicted text.
+跟踪器会在 `flush()` 时标记脏路径，并将它们与已接受的基线比较。对于不断增长或滚动的字符串，即使生产者已经知道自己追加或淘汰了文本，确认这种关系仍可能扫描保留的字符串。
 
-The original benchmark made this look expensive because its append fast path used `after.startsWith(before)`. V8 walked the producer's cons string character by character. Production Chord now uses:
+最初的基准测试让这看起来很昂贵，因为追加快速路径使用了 `after.startsWith(before)`。V8 逐字符遍历了生产者的 cons string。生产环境中的 Chord 现在使用：
 
 ```ts
 if (after.length > before.length && after.slice(0, before.length) === before) {
@@ -14,26 +14,26 @@ if (after.length > before.length && after.slice(0, before.length) === before) {
 }
 ```
 
-The slice flattens once and comparison uses the native string path. Flush-time dirty tracking also removed the prototype's retained-op amplification.
+`slice` 会将字符串展平一次，比较则使用原生字符串路径。刷新时的脏跟踪也移除了原型实现中保留操作不断放大的问题。
 
-## Local confirmation
+## 本地确认
 
-Measured 2026-09-01 against `origin/dev` at `1a7bc80e7`, using `packages/chord/src/delta/index.ts` directly under Node 26.0.0 on an Apple M5 Max. Each workload used 3,000 warmups followed by 11 samples of 10,000 mutation-plus-flush iterations; a second process reproduced the result.
+2026-09-01 针对 `origin/dev` 的 `1a7bc80e7` 进行测量，直接使用 `packages/chord/src/delta/index.ts`，环境为 Apple M5 Max 上的 Node 26.0.0。每个工作负载先预热 3,000 次，再采集 11 组、每组 10,000 次“变更加刷新”迭代；第二个进程复现了结果。
 
-| Workload | Median µs/flush, run 1 | Median µs/flush, run 2 |
+| 工作负载 | 第 1 次运行的刷新中位数（µs） | 第 2 次运行的刷新中位数（µs） |
 | --- | ---: | ---: |
-| 200 KB assistant string, append 8 characters | 18.68 | 17.81 |
-| 50 KB rolling window, slide 32 varied characters | 2.46 | 2.43 |
-| Transcript push, one small entry | 0.74 | 0.78 |
+| 200 KB assistant 字符串，追加 8 个字符 | 18.68 | 17.81 |
+| 50 KB 滚动窗口，滑动 32 个变化字符 | 2.46 | 2.43 |
+| Transcript push，一个小条目 | 0.74 | 0.78 |
 
-The assistant tracker started with 200,000 varied characters, appended `" abcdef"`, and flushed each append. The rolling tracker started with 50,000 varied characters, then assigned `text.slice(32) + chunk` using a distinct 32-character `chunk:<base36 index>:durable-stream` value on every flush; every flush was asserted to emit `t` + `a`. The transcript tracker pushed `{ id: "e<index>", text: "message <index>" }` and asserted one `p` per flush. Setup and garbage collection were outside each timed loop.
+assistant 跟踪器以 200,000 个不同字符开始，追加 `" abcdef"`，并在每次追加后刷新。滚动跟踪器以 50,000 个不同字符开始，然后使用 `text.slice(32) + chunk` 赋值；每次刷新使用不同的 32 字符 `chunk:<base36 index>:durable-stream` 值，并断言每次刷新都发出 `t` 加 `a`。Transcript 跟踪器推入 `{ id: "e<index>", text: "message <index>" }`，并断言每次刷新有一个 `p`。初始化和垃圾回收均不计入每个计时循环。
 
-At 100 assistant updates per second, the growing-string case consumes about 1.8 ms/s, approximately 0.18% of one core. The measured rolling-window cost is itself too small to justify the abandoned explicit API.
+assistant 每秒更新 100 次时，增长字符串场景约消耗 1.8 ms/s，即一个 CPU 核心的约 0.18%。测得的滚动窗口开销本身太小，不足以证明已放弃的显式 API 有必要。
 
-## Why the API is rejected
+## 为什么拒绝该 API
 
-The prototype required a text-specific dirty-node state, proxy-to-tracker lookup, repeated-append/drop folding, and interaction rules for later whole-value replacement. It produced subtle silent failures: one implementation fell through to the ordinary differ while tests still passed, and another drifted when drops reached into earlier appends.
+原型需要文本专用的脏节点状态、代理到跟踪器的查找、重复追加/丢弃折叠，以及后续整值替换的交互规则。它产生了难以察觉的静默失败：一个实现退回了普通 differ，但测试仍然通过；另一个实现则在丢弃范围涉及更早追加内容时发生漂移。
 
-That complexity does not justify saving microseconds below the surrounding replication, isolation, and rendering costs. Keep ordinary string mutation and the generic Chord op vocabulary.
+这类复杂度不值得节省复制、隔离和渲染开销之外的微秒级时间。保留普通字符串变更和通用 Chord 操作词汇。
 
-Reopen only when a production profile shows delta flush time is a meaningful fraction of a real workload. Re-measure the generic fast path first; a regression there is cheaper and safer to fix than adding a producer-specific API.
+只有当生产环境性能分析显示 delta 刷新时间占真实工作负载的显著比例时，才重新打开此议题。先重新测量通用快速路径；修复那里的回归比增加生产者专用 API 更便宜、更安全。

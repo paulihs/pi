@@ -1,35 +1,35 @@
-# WP01 — Bound values and lists
+# WP01 — 有界 Values 和 Lists
 
-## Status
+## 状态
 
-Complete. `harness.md` is normative. [`values.md`](../values.md) supplies the detailed address, backend, and conformance design.
+已完成。`harness.md` 是规范文档。[`values.md`](../values.md) 提供详细的地址、backend 和 conformance 设计。
 
-## Goal
+## 目标
 
-Replace the retained register/custom-state storage surface with bound `Value<T>` and `ValueList<T>` addresses across Session, Memory, JSONL, SQLite, instrumentation, tests, and public application access. Stop before runtime execution consumers.
+在 Session、Memory、JSONL、SQLite、instrumentation、测试和公开 application access 中，用有界的 `Value<T>` 与 `ValueList<T>` 地址替换保留的 register/custom-state 存储 surface。在运行时执行消费者之前停止。
 
-## Decisions fixed for this package
+## 本工作包固定的决策
 
-1. **Core and application namespaces.** Every core address uses the exact documented `pi.*` namespace. Applications use their own non-reserved namespaces through the same public `value()` / `list()` constructors. `fact.custom` and its API are deleted, not renamed to a built-in custom namespace.
-2. **Forks.** Generic forks copy only explicitly handled core addresses: Branch tip/lane configuration plus fresh lane state, session name, and labels whose targets copy. They copy no `pi.op.*`, `pi.pending.*`, list, ledger, or arbitrary application address. A later application feature must add an address-specific fork policy before relying on copied application state.
-3. **Trusted kind discipline.** Using one `(namespace, key)` as both a value and a list is a trusted-programming defect. Backends do not add cross-kind collision checks, triggers, registries, or catalogs.
-4. **Operation names.** Keep source `OperationMeta` for immutable acceptance metadata and `Operation` for the process-local `{ meta: OperationMeta, state: OperationState }` projection. `operationMeta(id)` binds `Value<OperationMeta>`; the composite is never persisted as one value.
-5. **Query ordering and bounds.** `scanValues()` returns key-ascending results. `readList()` limits only one query page, never total list length or bytes: reject non-positive or non-safe limits, default to 1,000, and clamp larger values to 10,000.
-6. **No WIP compatibility.** Replace the unfinished format-4 storage schema in place. JSONL remains format 4/storage version 1 but accepts only the new value/list records. SQLite keeps `SQLITE_STORAGE_VERSION = 1`, edits `001_initial.sql` in place, renames `registers` to `scalar_values`, and adds `list_values`. Pre-WP01 format-4 JSONL and SQLite files are unsupported. Add no migration runner or legacy decoder.
-7. **Generic infrastructure only.** WP01 defines every built-in value/list constructor, including future assistant/tool addresses, but does not implement their runtime consumers.
+1. **核心和应用命名空间。** 每个核心地址使用文档规定的精确 `pi.*` 命名空间。应用通过同一套公开 `value()`/`list()` 构造器使用自己的非保留命名空间。删除 `fact.custom` 及其 API，不把它改名为内置 custom namespace。
+2. **Fork。** 通用 fork 只复制明确处理的核心地址：Branch tip/lane configuration 加新 lane state、session name 以及目标被复制的 labels。不复制 `pi.op.*`、`pi.pending.*`、list、ledger 或任意 application address。后续应用功能若依赖复制的应用状态，必须先添加特定地址的 fork policy。
+3. **可信 kind 规则。** 将同一个 `(namespace, key)` 同时用作 value 和 list 是可信编程缺陷。Backend 不增加跨 kind 冲突检查、trigger、registry 或 catalog。
+4. **操作名称。** 保留源 `OperationMeta` 用于不可变 acceptance metadata，保留 `Operation` 用于进程本地 `{ meta: OperationMeta, state: OperationState }` projection。`operationMeta(id)` 绑定 `Value<OperationMeta>`；复合对象永远不作为一个 value 持久化。
+5. **查询顺序和上限。** `scanValues()` 返回按 key 升序的结果。`readList()` 只限制一次查询 page，不限制 list 总长度或字节数：拒绝非正数或非 safe limit，默认 1,000，更大的值限制为 10,000。
+6. **不做 WIP 兼容。** 原地替换未完成的 format-4 storage schema。JSONL 仍为 format 4/storage version 1，但只接受新的 value/list record。SQLite 保持 `SQLITE_STORAGE_VERSION = 1`，原地编辑 `001_initial.sql`，将 `registers` 重命名为 `scalar_values` 并增加 `list_values`。不支持 WP01 之前的 format-4 JSONL 和 SQLite 文件。不添加 migration runner 或 legacy decoder。
+7. **只做通用基础设施。** WP01 定义所有内置 value/list constructor，包括未来的 assistant/tool address，但不实现它们的运行时 consumer。
 
-## Public and storage contract
+## 公开和存储契约
 
-Add `packages/agent/src/harness/session/values.ts` with:
+添加 `packages/agent/src/harness/session/values.ts`，包含：
 
-- invariant `Value<T>` and `ValueList<T>` address types;
-- universal `value<T>(namespace, key?)` and `list<T>(namespace, key?)` constructors;
-- namespace/key validation only: non-empty namespace and no `\u0000` component;
-- `StoredValue<T>`, `ListElement<T>`, `ListCursor`, and `ListReadOptions`;
-- typed `setValue`, `deleteValue`, `appendList`, and `deleteList` write helpers using `NoInfer<T>`;
-- every exact built-in constructor and the five scan-prefix constructors from `values.md`.
+- 不可变的 `Value<T>` 和 `ValueList<T>` address 类型；
+- 通用 `value<T>(namespace, key?)` 和 `list<T>(namespace, key?)` 构造器；
+- 只做 namespace/key validation：namespace 非空，组件中不能有 `\u0000`；
+- `StoredValue<T>`、`ListElement<T>`、`ListCursor` 和 `ListReadOptions`；
+- 使用 `NoInfer<T>` 的类型化 `setValue`、`deleteValue`、`appendList` 和 `deleteList` 写 helper；
+- `values.md` 中的每个精确内置构造器和五个 scan-prefix 构造器。
 
-Replace the old API throughout:
+全局替换旧 API：
 
 ```ts
 getRegister(namespace, key)       -> getValue(address)
@@ -37,7 +37,7 @@ listRegisters(namespace, prefix) -> scanValues(prefixAddress)
 register set/delete writes        -> typed value helpers
 ```
 
-Storage and the historical Session reader, mutator, tree-view, and repository surfaces expose the same bound-address reads:
+Storage 和历史 Session reader、mutator、tree-view、repository surface 暴露同样的有界地址读操作：
 
 ```ts
 getValue<T>(address: Value<T>): Promise<StoredValue<T> | undefined>;
@@ -45,7 +45,7 @@ scanValues<T>(prefix: Value<T>): Promise<StoredValue<T>[]>;
 readList<T>(address: ValueList<T>, options?: ListReadOptions): Promise<ListElement<T>[]>;
 ```
 
-The historical tree-view and Session surfaces additionally expose one-commit direct writes:
+历史 tree-view 和 Session surface 还暴露单次 commit 的直接写入：
 
 ```ts
 setValue<T>(address: Value<T>, next: NoInfer<T>): Promise<void>;
@@ -54,24 +54,24 @@ appendList<T>(address: ValueList<T>, element: NoInfer<T>): Promise<void>;
 deleteList<T>(address: ValueList<T>): Promise<void>;
 ```
 
-`SessionMutator` retains one explicit `commit(writes)` and does not gain direct committing methods. Each write array composes helper-constructed value/list writes with entries and usage.
+`SessionMutator` 保留一个显式的 `commit(writes)`，不增加直接 commit 方法。每个 write array 都可以将 helper 构造的 value/list write 与 entry 和 usage 组合起来。
 
-Keep `getName` / `setName` and `getLabel` / `setLabel` as wrappers over `sessionName` and `entryLabel(id)`. Delete `getCustomFact` / `setCustomFact`. Rename the public passive metadata event from `fact_update` to the `value_update` shape already specified by `harness.md`; it covers only session-name and entry-label wrappers, not arbitrary application writes.
+保留 `getName`/`setName` 和 `getLabel`/`setLabel`，作为 `sessionName` 和 `entryLabel(id)` 的 wrapper。删除 `getCustomFact`/`setCustomFact`。将公开的被动 metadata event 从 `fact_update` 改为 `harness.md` 已规定的 `value_update` 形状；它只覆盖 session-name 和 entry-label wrapper，不覆盖任意 application write。
 
-## Files
+## 文件
 
-### Add
+### 添加
 
 - `packages/agent/src/harness/session/values.ts`
 - `packages/agent/test/harness/values.test.ts`
 - `packages/session-backends/sqlite-node/src/sqlite/session/values.ts`
 
-### Delete or rename
+### 删除或重命名
 
-- delete `packages/session-backends/sqlite-node/src/sqlite/session/registers.ts` after moving its scalar behavior to `values.ts`;
-- remove all register/global-map/custom-fact declarations from `packages/agent/src/harness/session/types.ts`.
+- 移动 scalar behavior 到 `values.ts` 后删除 `packages/session-backends/sqlite-node/src/sqlite/session/registers.ts`；
+- 从 `packages/agent/src/harness/session/types.ts` 移除所有 register/global-map/custom-fact declaration。
 
-### Agent source
+### Agent 源码
 
 - `packages/agent/src/harness/agent-harness.ts`
 - `packages/agent/src/harness/session/types.ts`
@@ -95,9 +95,9 @@ Keep `getName` / `setName` and `getLabel` / `setLabel` as wrappers over `session
 - `packages/agent/src/harness/runtime2/harness.ts`
 - `packages/agent/src/harness/runtime2/lane.ts`
 - `packages/agent/src/harness/telemetry.ts`
-- `packages/agent/src/index.ts` and `packages/agent/src/node.ts` only as needed to verify the new public exports; do not add a second export path.
+- 仅在验证新公开 export 必要时修改 `packages/agent/src/index.ts` 和 `packages/agent/src/node.ts`；不要增加第二条 export path。
 
-### Agent tests and generated documentation
+### Agent 测试和生成文档
 
 - `packages/agent/test/harness/memory-storage.test.ts`
 - `packages/agent/test/harness/memory-conformance.test.ts`
@@ -115,7 +115,7 @@ Keep `getName` / `setName` and `getLabel` / `setLabel` as wrappers over `session
 - `packages/agent/test/harness/runtime2/harness.test.ts`
 - `packages/agent/test/harness/runtime2/lane.test.ts`
 - `packages/agent/test/harness/runtime2/restore.test.ts`
-- regenerated `packages/agent/docs/telemetry-schema.md`
+- 重新生成 `packages/agent/docs/telemetry-schema.md`
 
 ### SQLite backend
 
@@ -123,7 +123,7 @@ Keep `getName` / `setName` and `getLabel` / `setLabel` as wrappers over `session
 - `packages/session-backends/sqlite-node/src/sqlite/repo.ts`
 - `packages/session-backends/sqlite-node/src/sqlite/session.ts`
 - `packages/session-backends/sqlite-node/src/sqlite/storage.ts`
-- `packages/session-backends/sqlite-node/src/sqlite/index.ts` if needed for the renamed module
+- 如果重命名模块需要，修改 `packages/session-backends/sqlite-node/src/sqlite/index.ts`
 - `packages/session-backends/sqlite-node/test/storage.test.ts`
 - `packages/session-backends/sqlite-node/test/storage-conformance.test.ts`
 - `packages/session-backends/sqlite-node/test/repo.test.ts`
@@ -133,43 +133,43 @@ Keep `getName` / `setName` and `getLabel` / `setLabel` as wrappers over `session
 ### Coding-agent consumer
 
 - `packages/coding-agent/test/experimental-session-support.ts`
-- verify `packages/coding-agent/test/experimental-remote-runtime.test.ts`
-- verify `packages/coding-agent/test/experimental-server-replacement.test.ts`
+- 验证 `packages/coding-agent/test/experimental-remote-runtime.test.ts`
+- 验证 `packages/coding-agent/test/experimental-server-replacement.test.ts`
 
-If the final old-API grep identifies another retained source/test call site, it belongs to WP01; do not add a compatibility shim to avoid touching it.
+如果最终旧 API grep 发现另一个保留的 source/test call site，它属于 WP01；不要为了避免触碰它而增加兼容垫片。
 
-## Work, in order
+## 工作顺序
 
-1. **Add the address vocabulary.** Implement `values.ts`, export it through the existing session/root path, and add focused compile-time/runtime address tests. Include exact built-in namespace/key/kind tests and prefix-constructor tests before migrating callers.
-2. **Cut the shared API once.** Replace register types and writes in `types.ts`/`commit.ts`; split `StorageState` into current scalar values and surviving list elements; implement Memory reads/writes, ordered prefix scans, paged list reads, transaction validation/application, snapshots, and direct Session methods. Remove custom-fact APIs and migrate name/label wrappers.
-3. **Migrate JSONL and generic fork/snapshot code.** Encode only `kind:"value"` and `kind:"list"`; replay set/delete/append/delete; preserve transaction-line torn-tail atomicity; serialize surviving list elements with original `seq` merged in global sequence order; preserve the sequence high-water mark. This extends existing snapshot serialization only—do not add a new compaction trigger or precise-rewrite feature. Forks copy the fixed core set from Decisions item 2, re-sequence destination scalar values after copied entries as today, and copy no lists.
-4. **Migrate instrumentation, conformance, and benchmarks.** The storage decorator exposes all three reads; instrumented storage records erased value/list writes in exact order without content telemetry. Extend shared conformance before backend-specific assertions.
-5. **Migrate runtime2 shell call sites.** Replace lane/harness raw writes with built-in constructors/helpers. `restore.ts` uses `scanValues(branchTipInventoryPrefix())` plus exact `getValue` lookups and performs no `readList()` call. Do not add acceptance, drive, hydration, or cleanup behavior.
-6. **Replace the SQLite WIP schema and adapter.** Edit `001_initial.sql` in place, implement scalar operations and indexed list append/delete/paging in `session/values.ts`, keep every write inside the existing `BEGIN IMMEDIATE` writer-lease transaction, update both fork snapshot paths, and retain all entry/usage/branch/lease behavior from current `dev`.
-7. **Migrate public events, tests, and the coding-agent helper.** Remove old type assertions and raw namespaces. Change `fact_update` to `value_update`. Keep the two remote prompt tests skipped for the existing WP00 reason; WP01 must not alter runtime execution.
-8. **Update telemetry and documentation.** Change `pi.session.write` item kinds from `register` to `value` and `list`, regenerate `telemetry-schema.md`, run the old-API sweeps, and record any branch-policy-deferred changelog requirement. Do not edit a changelog on `gramps` unless it becomes a pull-request branch or the user requests it.
+1. **添加地址词汇。** 实现 `values.ts`，通过现有 session/root path 导出，并添加聚焦的编译期/运行时 address 测试。在迁移 caller 前，先覆盖精确内置 namespace/key/kind 和 prefix-constructor 测试。
+2. **一次切断共享 API。** 替换 `types.ts`/`commit.ts` 中的 register 类型和写入；将 `StorageState` 拆为当前 scalar value 和存活 list element；实现 Memory read/write、有序 prefix scan、分页 list read、transaction validation/application、snapshot 和直接 Session method。移除 custom-fact API，迁移 name/label wrapper。
+3. **迁移 JSONL 和通用 fork/snapshot code。** 只编码 `kind:"value"` 和 `kind:"list"`；重放 set/delete/append/delete；保留 transaction-line torn-tail 原子性；以原始 `seq` 在全局 sequence order 中合并存活 list element；保留 sequence high-water mark。这只扩展已有 snapshot serialization——不要增加新的 compaction trigger 或 precise-rewrite feature。Fork 复制 Decisions 第 2 项的固定核心集合，像现在一样在复制 entry 后重新编号 destination scalar value，不复制 list。
+4. **迁移 instrumentation、conformance 和 benchmark。** Storage decorator 暴露三种 read；instrumented storage 按精确顺序记录擦除后的 value/list write，但 telemetry 不含内容。在 backend-specific assertion 前扩展 shared conformance。
+5. **迁移 Runtime2 shell call site。** 用内置 constructor/helper 替换 lane/harness raw write。`restore.ts` 使用 `scanValues(branchTipInventoryPrefix())` 加精确 `getValue` lookup，不调用 `readList()`。不要增加 acceptance、drive、hydration 或 cleanup 行为。
+6. **替换 SQLite WIP schema 和 adapter。** 原地编辑 `001_initial.sql`，在 `session/values.ts` 中实现 scalar operation 和带 index 的 list append/delete/paging，让每次 write 保持在现有 `BEGIN IMMEDIATE` writer-lease transaction 内，更新两条 fork snapshot 路径，并保留当前 `dev` 中所有 entry/usage/branch/lease 行为。
+7. **迁移公开 event、测试和 coding-agent helper。** 移除旧 type assertion 和 raw namespace。把 `fact_update` 改为 `value_update`。保留两个 remote prompt test 的 skip 以及现有 WP00 原因；WP01 不得修改 runtime execution。
+8. **更新 telemetry 和文档。** 将 `pi.session.write` item kind 从 `register` 改为 `value` 和 `list`，重新生成 `telemetry-schema.md`，运行旧 API sweep，并记录任何因 branch policy 延迟的 changelog 要求。除非 `gramps` 成为 pull-request branch 或用户要求，否则不要编辑 changelog。
 
-## Backend requirements
+## Backend 要求
 
 ### Memory
 
-- prepare and validate the complete transaction before mutating entries, values, lists, usage, or stats;
-- current scalar replacement stores only the latest value and set `seq`;
-- list append performs no list read and stores each global write `seq`;
-- list delete removes the whole exact key;
-- snapshots include current scalar values and surviving list elements.
+- 在修改 entry、value、list、usage 或 stats 前准备并验证完整 transaction；
+- 当前 scalar replacement 只存最新 value 和 set `seq`；
+- list append 不读取 list，并为每个 global write 存储 `seq`；
+- list delete 删除整个精确 key；
+- snapshot 包含当前 scalar value 和存活 list element。
 
 ### JSONL
 
-- keep format 4/storage version 1 with no legacy register decode;
-- one single-write object or multi-write array remains one atomic line;
-- replay produces the same logical state as Memory;
-- torn final lines expose no partial transaction;
-- snapshot serialization preserves surviving list-element sequences and the next-sequence high-water mark.
+- 保持 format 4/storage version 1，不解码 legacy register；
+- 单次写入 object 或多写入 array 仍是一条 atomic line；
+- replay 产生与 Memory 相同的逻辑状态；
+- torn final line 不暴露部分 transaction；
+- snapshot serialization 保留存活 list-element sequence 和 next-sequence high-water mark。
 
 ### SQLite
 
-Use:
+使用：
 
 ```sql
 CREATE TABLE scalar_values (
@@ -189,61 +189,61 @@ CREATE TABLE list_values (
 ) WITHOUT ROWID;
 ```
 
-Ascending and descending list queries use the primary key with an exclusive sequence predicate and `LIMIT`. Add `EXPLAIN QUERY PLAN` assertions proving no table scan or temporary ordering b-tree. Do not change storage version, add migrations, or weaken the current lease/fence/fork behavior.
+升序和降序 list query 使用 primary key、exclusive sequence predicate 和 `LIMIT`。添加 `EXPLAIN QUERY PLAN` assertion，证明没有 table scan 或临时 ordering b-tree。不要改变 storage version、添加 migration 或削弱现有 lease/fence/fork 行为。
 
-## Required coverage
+## 必需覆盖
 
-### Address and type tests
+### Address 和类型测试
 
-- invariant address typing and inferred scalar/list result types;
-- `NoInfer` rejects incompatible set/append values;
-- scalar helpers reject list addresses and list helpers reject scalar addresses;
-- independently constructed equal addresses resolve the same location;
-- empty key works; empty namespace and `\u0000` components reject;
-- exact built-in namespaces/key grammars and exactly five prefix constructors;
-- application-wide and dynamic non-reserved addresses require no second operation-time key;
-- no registry, catalog, privilege constructor, global value map, or runtime `pi.*` gate.
+- 不变量 address typing 以及推断的 scalar/list result type；
+- `NoInfer` 拒绝不兼容的 set/append value；
+- scalar helper 拒绝 list address，list helper 拒绝 scalar address；
+- 独立构造的相同 address 解析到同一位置；
+- 空 key 可用；空 namespace 和包含 `\u0000` 的组件拒绝；
+- 精确内置 namespace、key grammar 和恰好五个 prefix constructor；
+- application-wide 和 dynamic non-reserved address 不需要第二个 operation-time key；
+- 没有 registry、catalog、privilege constructor、global value map 或运行时 `pi.*` gate。
 
 ### Shared scalar/list conformance
 
-- scalar set/get/delete/delete-absent/recreate and latest set `seq`;
-- namespace-scoped, key-ascending prefix scans;
-- append one and several elements, including several appends in one transaction;
-- appends separated by unrelated writes preserve per-list order and global element sequences;
-- ascending/descending exclusive cursors;
-- default, explicit, invalid, and clamped query-page limits;
-- absent list, whole-list delete, delete-absent, and delete-then-append;
-- atomic entry + usage + value + list transactions;
-- rollback when any sibling write is invalid;
-- no list read on append;
-- close rejects later reads while already-admitted commits drain.
+- scalar set/get/delete/delete-absent/recreate 和 latest set `seq`；
+- namespace-scoped、key-ascending prefix scan；
+- append 一个和多个 element，包括一个 transaction 内的多个 append；
+- 与无关 write 分隔的 append 保留每个 list 的顺序和 global element sequence；
+- ascending/descending exclusive cursor；
+- 默认、显式、无效和 clamp 的 query-page limit；
+- absent list、whole-list delete、delete-absent 和 delete-then-append；
+- atomic entry + usage + value + list transaction；
+- 任意 sibling write 无效时 rollback；
+- append 不读取 list；
+- close 拒绝后续 read，同时 drain 已准入 commit。
 
-Do not add a value/list collision test: cross-kind misuse is intentionally an unenforced trusted-programming defect.
+不要添加 value/list collision test：跨 kind misuse 是有意不强制的 trusted-programming defect。
 
-### Backend and repository tests
+### Backend 和 repository 测试
 
-- identical Memory/JSONL/SQLite pages and cursors;
-- JSONL single/multi-write replay, torn-tail behavior, and sequence-preserving snapshot output;
-- SQLite query plans and writer-lease transaction behavior;
-- branch/tree forks copy session name, eligible labels, and lane configuration/Branch tip with fresh lane state;
-- forks exclude operation/pending values, all lists, application addresses, last results, queues, and ledger rows;
-- repository parent metadata, entry IDs, stats, branch indexes, v3 normalization, UUIDv7/follower IDs, and current SQLite lease/fork scenarios remain unchanged;
-- runtime2 restore enumerates lanes through the one prefix constructor and reads no list.
+- Memory/JSONL/SQLite page 和 cursor 相同；
+- JSONL single/multi-write replay、torn-tail 行为和保留 sequence 的 snapshot output；
+- SQLite query plan 和 writer-lease transaction 行为；
+- branch/tree fork 复制 session name、符合条件的 label 和 lane configuration/Branch tip，并使用新 lane state；
+- fork 排除 operation/pending value、所有 list、application address、last result、queue 和 ledger row；
+- repository parent metadata、entry ID、stats、branch index、v3 normalization、UUIDv7/follower ID 以及当前 SQLite lease/fork 场景保持不变；
+- Runtime2 restore 通过唯一 prefix constructor 枚举 lane，且不读取 list。
 
-## Deferred consumers
+## 延后的 Consumer
 
-The following `values.md` requirements are explicitly not WP01 coverage:
+以下 `values.md` 要求明确不属于 WP01 coverage：
 
-- assistant frame conversion, append scheduling, settlement, recovery, cancellation, snapshot hydration, and byte-growth tests (R2/R3/R6/R12);
-- invocation `getMemo` / `setMemo`, tool-output checkpoint writes, outcome cleanup, and prefix-driven operation cleanup (R4/R6);
-- any consumption-time list hydration beyond proving base restore reads no list;
-- runtime acceptance, driving, provider/tool effects, or operation-state redesign.
+- assistant frame conversion、append scheduling、settlement、recovery、cancellation、snapshot hydration 和 byte-growth test（R2/R3/R6/R12）；
+- invocation `getMemo`/`setMemo`、tool-output checkpoint write、outcome cleanup 和 prefix-driven operation cleanup（R4/R6）；
+- 除证明 base restore 不读取 list 外的任何 consumption-time list hydration；
+- runtime acceptance、driving、provider/tool effect 或 operation-state redesign。
 
-WP01 still exports `pendingAssistantFrames`, `operationToolMemo`, `pendingToolOutput`, and every cleanup prefix so later packages do not redesign storage.
+WP01 仍导出 `pendingAssistantFrames`、`operationToolMemo`、`pendingToolOutput` 和每个 cleanup prefix，使后续包不必重设计存储。
 
-## Removal checks
+## 移除检查
 
-These must have zero matches in retained source/tests, excluding immutable released changelog history and archived prose:
+以下内容在保留的 source/test 中必须为零匹配，immutable released changelog history 和 archived prose 除外：
 
 ```bash
 rg -n 'getRegister\(|listRegisters\(|RegisterValues|RegisterNamespace|RegisterSetWrite|\bRegister<' \
@@ -267,11 +267,11 @@ rg -n '"register"' \
   packages/agent/docs/telemetry-schema.md
 ```
 
-Do not treat unrelated model/provider/hook registration terminology as storage API residue.
+不要把无关的 model/provider/hook registration 术语当作 storage API 残留。
 
-## Validation
+## 验证
 
-Run each created or modified test file directly and iterate until green. At minimum:
+直接运行每个新建或修改的测试文件，循环修复直到通过。最低要求：
 
 ```bash
 # From packages/agent
@@ -308,7 +308,7 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
   test/experimental-server-replacement.test.ts
 ```
 
-Then run from the repository root:
+然后从 repository root 运行：
 
 ```bash
 cd packages/agent && npm run check:telemetry-docs
@@ -320,8 +320,8 @@ npm run check
 ./test.sh
 ```
 
-Never run unrestricted Vitest, `npm test`, paid-provider tests, or `npm run build`.
+不要运行不受限 Vitest、`npm test`、付费 provider 测试或 `npm run build`。
 
-## Stop condition
+## 停止条件
 
-Stop when every retained backend and Session surface uses bound values/lists; all core addresses use the exact `pi.*` grammar; arbitrary application addresses work but generic forks exclude them; old register/fact/custom-state APIs and physical names are absent; base restore performs no list read; schema/compatibility decisions above are implemented; focused, conformance, TypeScript, telemetry-doc, diff, and repository checks pass. Report the final schema and fork behavior. Do not begin runtime acceptance, assistant/tool consumers, or any later work package.
+所有保留的 backend 和 Session surface 都使用有界 values/lists；所有核心 address 使用精确的 `pi.*` grammar；任意 application address 可用但通用 fork 会排除它们；旧 register/fact/custom-state API 和物理名称均不存在；base restore 不读取 list；上述 schema/兼容决策已实现；聚焦、conformance、TypeScript、telemetry-doc、diff 和 repository 检查通过。报告最终 schema 和 fork 行为。不要开始 runtime acceptance、assistant/tool consumer 或后续工作包。

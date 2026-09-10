@@ -1,407 +1,240 @@
-# Session Storage: Scopes
+# Session Storage：作用域
 
-> **Status:** Design evidence. The actionable Step 1 contract is [`implementation-handoff.md`](implementation-handoff.md), which supersedes this document on sequence allocation, reusable scope IDs, retirement authority/records, sidecar layout, implementation order, and the separation of JSONL encoding into Step 2.
+> 状态：设计证据。可执行的第 1 步契约以 implementation-handoff.md 为准；该文档更新了序号分配、可复用作用域 ID、回收权限与记录、sidecar 布局、实现顺序，以及将 JSONL 编码拆到第 2 步的安排。
 >
-> **Scope:** `packages/agent/src/harness/session/`, plus the call sites in
-> `runtime/` listed in §10.
+> 范围：packages/agent/src/harness/session/，以及第 10 节列出的 runtime 调用点。
 >
-> **Depends on [01-delta](../01-delta/delta.md)** for the landed Chord op vocabulary that pending state is stored in (§2, §11) and for the `WireOp` form the record encoding carries (§12). The two
-> are otherwise independent and compound: encoding shrinks every write, scopes
-> move one class of write out of the main log entirely.
->
-> Every claim here was checked against `runtime/lane.ts`, `runtime/progress.ts`
-> and `runtime/drive/*.ts`. The type-level enforcement in §6 was verified with
-> `tsc --strict`, including that mixed-scope commits are the *only* thing it
-> rejects.
+> 依赖：01-delta 提供 Chord 操作词汇和 WireOp 形式。编码和作用域是相互独立但可以叠加的优化：编码减少每次写入，作用域则让一类写入完全离开主日志。
 
-## 1. The problem
+## 1. 问题
 
-Operation state — pending tool output, pending assistant output — matters only
-while the operation runs. It is crash-recovery scaffolding, not history.
+待处理的工具输出和助手输出只在操作运行期间有意义，是崩溃恢复脚手架，不是历史记录。
 
-The JSONL log is append-only, so it persists anyway. Worse, deleting it *adds*
-records: `deleteValue` and `deleteList` write a line each, and those lines also
-persist. Today only a full snapshot rewrite reclaims the space, and no in-place
-compaction exists (`jsonl/storage.ts` has `createFromSnapshot`, used for fork).
+JSONL 日志是追加式的，因此这些数据会一直保留。删除数据还会追加 deleteValue 或 deleteList 记录，这些记录同样会持久化。当前只有完整快照重写才能回收空间，jsonl/storage.ts 没有原地压缩能力。
 
-Measured on 20 operations, each 400 assistant frames plus 2 tools at 60
-checkpoints of a 50 KB window:
+在 20 个操作、每个操作 400 个助手帧、2 个工具调用、60 个检查点、窗口 50 KB 的测量中：
 
-| | size |
+| 项目 | 大小 |
 | --- | --- |
-| total JSONL | 93.89 MB |
-| settled transcript entries — the part that is actually history | **0.06 MB** |
+| JSONL 总大小 | 93.89 MB |
+| 已结算的 transcript 条目，也就是实际历史 | **0.06 MB** |
 
-Three orders of magnitude of the file is scaffolding for finished operations.
+因此，文件中绝大多数内容都是已完成操作的脚手架。
 
-**Two independent fixes, and they are not alternatives:**
+这里有两个相互独立、不能互相替代的修复：
 
-- **Encoding** ([delta.md](../01-delta/delta.md)): value writes carry Chord ops rather than whole values, and addresses are interned. Takes the same workload to **5.32 MB in a single file**, with no change to atomicity. The op vocabulary and flush-time tracker have landed; storage integration has not.
-- **Scopes** (this document): pending state leaves the main log entirely, so it is
-  never history to begin with.
+- 编码：value 写入携带 Chord 操作而不是完整值，并对地址做 intern。相同负载可从单文件 93.89 MB 降到 5.32 MB，不改变原子性。
+- 作用域：待处理状态写入独立文件，因此从一开始就不会成为历史。
 
-Do the encoding first. Scopes are worth it because 5.32 MB of dead weight per 20
-operations still accumulates, and there is no compaction pass to reclaim it.
+先落地编码。即使编码后每 20 个操作仍有 5.32 MB 无效数据，作用域依然值得做，因为它会持续累积，而当前没有压缩流程可回收。
 
-## 2. Scope on the address
+## 2. 地址上的作用域
 
-Scope has two halves that must not be confused: a **type-level tag** carrying no
-data, and a **runtime scope id** that names the file.
+作用域有两个不能混淆的部分：不携带数据的类型标签，以及用于命名文件的运行时作用域 ID。
 
-```ts
-export type SessionScope   = { readonly kind: "session" };
+~~~ts
+export type SessionScope = { readonly kind: "session" };
 export type EphemeralScope = { readonly kind: "ephemeral" };
 export type Scope = SessionScope | EphemeralScope;
 
-// Passing a scopeId is what makes an address ephemeral.
+// 传入 scopeId 后，地址才会成为临时作用域地址。
 export function value<T>(namespace: string, key: string): Value<T, SessionScope>;
 export function value<T>(namespace: string, key: string, scopeId: string): Value<T, EphemeralScope>;
 
 export function list<T>(namespace: string, key: string): ValueList<T, SessionScope>;
 export function list<T>(namespace: string, key: string, scopeId: string): ValueList<T, EphemeralScope>;
 
-/** A main-log record retiring an ephemeral scope. See §5. */
+// 主日志中的临时作用域回收记录。
 export function retireScope(id: string): Write<SessionScope>;
-```
+~~~
 
-The suffix is not decoration: `Session` already names the session interface in
-`harness/session/types.ts`, and reusing it produces `TS2440`/`TS2484` plus an
-ambiguous re-export from `session/index.ts`.
+这里的名称是有意选择的：Session 已经是 harness/session/types.ts 中的接口名，重复使用会导致 TS2440、TS2484，以及 session/index.ts 的歧义导出。
 
-```ts
+~~~ts
 interface Value<T, Sc extends Scope = SessionScope> extends ScopedAddress<Sc> {
   readonly namespace: string;
   readonly key: string;
-  /** Present iff Sc is Ephemeral. Routes the write and names the sidecar. */
+  // 仅 Ephemeral 作用域存在；用于路由写入并命名 sidecar。
   readonly scopeId?: string;
 }
-```
+~~~
 
-The id is a plain runtime string, because it is an operation id — generated at
-runtime and unavailable to the type system. That is precisely why §6 can
-distinguish *session from ephemeral* statically but cannot distinguish *two
-different ephemeral scopes*: the tag is in the type, the id is not.
+ID 是普通运行时字符串，因为它是运行时生成的操作 ID，类型系统无法知道它的值。因此第 6 节可以静态区分 session 和 ephemeral，却不能区分两个不同的临时作用域：标签存在于类型中，ID 存在于运行时。
 
-```ts
-// Durable lists carry encoded batches; one encoder/decoder pair belongs to each value stream.
+~~~ts
 export const pendingToolOutput = (operationId: string, invocationId: string) =>
-  list<WireOp[]>("pi.pending.tool_output", `${operationId}:${invocationId}`, operationId);
+  list<WireOp[]>("pi.pending.tool_output", operationId + ":" + invocationId, operationId);
 
 export const pendingAssistantOutput = (operationId: string, entryId: string) =>
-  list<WireOp[]>("pi.pending.assistant_output", `${operationId}:${entryId}`, operationId);
+  list<WireOp[]>("pi.pending.assistant_output", operationId + ":" + entryId, operationId);
 
 export const operationToolMemo = (operationId: string, invocationId: string, name: string) =>
-  value<JsonValue>("pi.op.tool_memo", `${operationId}:${invocationId}:${name}`, operationId);
+  value<JsonValue>("pi.op.tool_memo", operationId + ":" + invocationId + ":" + name, operationId);
 
-// unchanged — no scopeId, so Session by inference
-export const laneStateValue = (lane: string) => value<DurableLaneState>("pi.lane.state", lane);
-```
+// 没有 scopeId，因此按推断属于 Session。
+export const laneStateValue = (lane: string) =>
+  value<DurableLaneState>("pi.lane.state", lane);
+~~~
 
-**Scope is the file.** A session-scoped write goes to the main log; an
-ephemeral-scoped write goes to `<session>.<scopeId>.jsonl`.
+作用域就是文件：session 作用域写入主日志，临时作用域写入 <session>.<scopeId>.jsonl。
 
-Other backends need no sidecars at all: in-memory drops a `Map` keyed by scope id,
-SQLite issues one `DELETE ... WHERE scope = ?`. Scope is meaningful to them only as
-a lifetime hint. It is JSONL that needs the file split, and that is where the
-constraints in §4 and §5 come from.
+其他后端不需要 sidecar：内存后端可以丢弃按作用域 ID 分组的 Map，SQLite 可以执行 DELETE ... WHERE scope = ?。作用域对它们只是生命周期提示；需要文件拆分的是 JSONL，后续约束也因此主要针对 JSONL。
 
-## 3. Which addresses are scoped, and why
+## 3. 哪些地址需要作用域
 
-The boundary is drawn by **write isolation**, not by lifetime.
+边界应该按写入隔离来划分，而不是按生命周期划分。
 
-Scoping everything under `pi.op.*` on the grounds that it dies with the operation
-looks right and is wrong. `lane.ts` shows why: **every** operation commit bundles
-`operationState` with `laneState`.
+把所有 pi.op.* 值都标成临时作用域看似合理，但 lane.ts 显示这会破坏协调状态：每次操作提交都会同时写 operationState 和 laneState。
 
-```ts
-// lane.ts:405/431, 659/660, 749/750, 1071/1072 — the same shape each time
+~~~ts
 writes: [
   ...decision.writes,
   setValue(operationStateValue(operationId), decision.operationState),
   setValue(laneStateValue(this.name), durableLaneState(...)),
 ]
-```
+~~~
 
-That pair is coordination state: lane state says the operation is at step N,
-operation state holds the data for step N. Splitting them across files makes a
-crash produce a lane that believes it is somewhere the data does not support.
+这两个值共同描述协调状态：lane state 表示操作处于第 N 步，operation state 保存该步骤需要的数据。若拆到两个文件，崩溃可能留下一个认为自己处于某步骤的 lane，但对应数据并不存在。
 
-The **bulk** values behave differently. `openProgress` commits exactly one write
-(`runtime/progress.ts:51`), and `pendingToolOutput` / `pendingAssistantFrames`
-appear in multi-write transactions only as *deletes*.
+批量值的行为不同。openProgress 只提交一次写入；pendingToolOutput 和 pendingAssistantFrames 在多写事务中只以删除形式出现。
 
-| | addresses |
+| 类别 | 地址 |
 | --- | --- |
-| **ephemeral (sidecar)** | `pi.pending.tool_output`, `pi.pending.assistant_output`, `pi.op.tool_memo` |
-| **session (main log)** | `pi.lane.state`, `pi.op.state`, `pi.op.meta`, `pi.result`, `pi.pending.entry`, `pi.branch.tip`, `pi.op.tool_args`, `pi.op.preparation` |
+| **临时作用域，sidecar** | pi.pending.tool_output、pi.pending.assistant_output、pi.op.tool_memo |
+| **Session 作用域，主日志** | pi.lane.state、pi.op.state、pi.op.meta、pi.result、pi.pending.entry、pi.branch.tip、pi.op.tool_args、pi.op.preparation |
 
-`operationToolMemo` is ephemeral so that the memo-plus-checkpoint bundling in
-`harness-tools.md` §7.5 is a single-file transaction. `terminal.ts:34` already
-treats `operationToolMemoPrefix` and `pendingToolOutputPrefix` as the same cleanup
-class, so this matches how the code already thinks about them.
+operationToolMemo 也放入临时作用域，使 harness-tools.md 第 7.5 节中的 memo 与检查点可以保持单文件事务。terminal.ts 已经把 operationToolMemoPrefix 和 pendingToolOutputPrefix 作为同一类清理对象处理，因此这与现有代码的分类一致。
 
-The size win is unaffected by leaving `operationState` behind: effectively all of
-the 93.89 MB in §1 is pending tool and assistant output.
+## 4. 两个文件无法提供跨文件原子性
 
-## 4. Two files are not atomic
+Session 线上的串行化只能提供顺序，不能提供原子性。对两个文件描述符分别 write、分别 fsync 时，如果中间崩溃，两个文件就可能不一致，而 JSONL 没有跨文件修复机制。
 
-Serialising on the Session line gives **ordering, not atomicity**. Two `write()`
-calls to two descriptors, two fsyncs, no journal spanning them. A crash between
-leaves the files disagreeing, and JSONL has nothing to repair it with.
+设计不尝试实现跨文件事务，而是保证它们不会发生：
 
-So the design does not try to make cross-file transactions work. It ensures none
-exist:
+> 一个事务中的所有写入必须属于同一作用域。
 
-> **All writes in a transaction share one scope.**
+现有代码经过审计后已经基本满足该规则。因为不需要跨文件提交，所以：
 
-That is achievable because it is already true of the code — see §5 for the audit.
+- 不需要 sidecar 先写、fsync，再向主日志写确认记录；
+- sidecar-only 写入不需要主日志 commit marker；
+- 仍需明确 sidecar 的 durability 策略。若 fsync 更宽松，最近检查点可能丢失，这应当是有意接受的有限丢失。
 
-Two consequences of *not* needing cross-file commits:
+## 5. 审计结果
 
-- **No write ordering between files is required.** The commit-record pattern
-  (sidecar first, fsync, then a main-log record acknowledging it) is unnecessary if
-  no transaction spans files. There is nothing to acknowledge.
-- **No commit marker for sidecar-only writes.** One tempting design is a small
-  main-log record for `openProgress`, since nothing acknowledges its write. It is
-  not needed: that transaction is one write in one file and already atomic. Torn
-  tails are handled the same way as in the main log — every line is a complete op
-  or a whole batch, so a reader stops at the last intact one.
+检查 lane.ts 的 12 个提交点和 runtime/drive/*.ts 的 32 个 writes 生产点后，结论是：没有事务真正写入两个文件，但有四类事务把临时状态删除和主日志写入放在一起：
 
-What remains is a **durability** choice, not a consistency one: if the sidecar is
-fsynced less aggressively, recent checkpoints can be lost. That is the same bounded
-loss the checkpoint interval already accepts, but it should be a deliberate policy
-rather than an accident.
+- response.ts 的结算提交：写 entry、usage、branch tip，同时删除 pending assistant frames；
+- terminal.ts 的 operationCleanupWrites：删除 tool memos、tool outputs，并写 operation result 与 lane state；
+- tools.ts 的工具结算；
+- deferred.ts 的被替代响应处理。
 
-## 5. Audit: does the existing code satisfy the rule?
+调整方式是让回收成为主日志记录：
 
-Every commit in `lane.ts` (12 sites) and every `writes:` producer in
-`runtime/drive/*.ts` (32 sites) was read.
-
-**Result: yes, with one adjustment.** No transaction writes to two files. The
-spanning cases are all *deletes* of ephemeral state bundled with main-log writes:
-
-- `response.ts:340` — the settle commit: `insertEntry`, `insertUsage`,
-  `setValue(branchTip)`, plus `deleteList(pendingAssistantFrames(...))`.
-- `terminal.ts:50` `operationCleanupWrites` — bundles main-log deletes with
-  `toolMemos` and `toolOutputs` deletes, returned into the same array as
-  `operationResultValue` and `laneStateValue`.
-- `tools.ts:230, 257` — `deleteValue(pendingToolOutput)` with main-log writes.
-- `deferred.ts:157` — `deleteList(pendingAssistantFrames)`.
-
-**The adjustment: retirement becomes a main-log record.**
-
-```ts
+~~~ts
 retireScope(operationId): Write<SessionScope>
-```
+~~~
 
-The log is the truth; the sidecar file is a cache. Recovery reads the retire record
-and ignores — then removes — the sidecar. Unlinking eagerly after commit is a pure
-optimisation; losing the unlink costs disk, never correctness.
+主日志是真实来源，sidecar 是缓存。恢复时读取 retire 记录并忽略、删除对应 sidecar。提交后立即 unlink 只是优化；若 unlink 丢失，最多占用磁盘，不影响正确性。
 
-This makes all four sites above single-scope, because the individual ephemeral
-deletes disappear. It also *simplifies* `operationCleanupWrites`: the `scanValues`
-calls for `operationToolMemoPrefix` and `pendingToolOutputPrefix` are replaced by
-one `retireScope`.
+这样上述事务都会回到单一作用域，operationCleanupWrites 也可以由扫描并逐项删除改成一次 retireScope。临时状态在操作结算前保留，结算时整体丢弃；它受操作轮次限制，且从不进入主日志。
 
-And it makes the open-time sweep principled rather than heuristic. A sidecar is
-dead iff the main log retired it or its operation is absent — no inference from
-operation status.
+### 5.1 一个事务不会出现两个临时作用域
 
-### 5.1 Two ephemeral scopes in one transaction cannot arise
+一个 lane 只有一个 operation。每个写入集合使用同一个 operationId；回收与启动始终是两个事务。并发发生在不同 lane 之间，每个 lane 最多有一个活动操作，因此两个临时作用域不会进入同一个提交。第 6 节的运行时断言是对未来改动的防御。
 
-A lane holds `operation: { meta, state } | null` — **singular**. Every write set
-uses one `operationId`, either `drive.operationId` or the newly created one in
-`startOperation`, which asserts no operation is active. Retire and start are always
-separate transactions: the settle commits at `lane.ts:427` and `response.ts:339`
-set lane state to `null`.
+## 6. 静态约束
 
-Concurrency is across **lanes**, and each lane has at most one active operation, so
-two ephemeral scopes never meet in a commit. The runtime assertion in §6 is defence
-against a future change, not a live gap.
+scopes.variance.ts 是本节的可执行形式，可使用 npx tsc --noEmit --strict --lib es2023 scopes.variance.ts 检查。三个 @ts-expect-error 用例在约束被削弱时也会暴露问题。
 
-## 6. Static enforcement
+需要两个只用于类型的 phantom type，它们的 Sc 出现位置不同：
 
-> **`scopes.variance.ts` ships alongside this doc** and is the executable form of
-> this section: `npx tsc --noEmit --strict --lib es2023 scopes.variance.ts`.
-> Silence means the rule holds. Its three `@ts-expect-error` lines fail the
-> compile if they ever start type-checking, so it catches the enforcement being
-> weakened as well as broken.
-
-
-Two phantom types, differing only in where `Sc` appears. This distinction is
-load-bearing and is the single easiest thing to get wrong here.
-
-```ts
+~~~ts
 declare const storedScopeType: unique symbol;
 
-/** Addresses: COVARIANT — Sc only in return position. */
+// 地址：协变，Sc 只出现在返回位置。
 export interface ScopedAddress<Sc extends Scope> {
-	readonly [storedScopeType]?: () => Sc;
+  readonly [storedScopeType]?: () => Sc;
 }
 
-/** Writes: INVARIANT — Sc in both parameter and return position. */
+// 写入：不变，Sc 同时出现在参数和返回位置。
 export interface Scoped<Sc extends Scope> {
-	readonly [storedScopeType]?: (scope: Sc) => Sc;
+  readonly [storedScopeType]?: (scope: Sc) => Sc;
 }
+~~~
 
-export interface Value<T, Sc extends Scope = SessionScope>
-	extends StoredAddressBase, ScopedAddress<Sc> { … }
+读取地址在任意作用域都安全，getValue 不关心文件位置；但构造事务不安全，因为两个文件不具备原子性，提交必须固定为一个作用域。
 
-export interface ValueSetWrite<Sc extends Scope> extends Scoped<Sc> { … }
-```
+因此约束应放在构造事务的位置，而不是读取地址的位置。setValue<T, Sc> 从协变地址推导作用域，再将其盖到不变写入上。若把地址也设为不变，会让 getValue、scanValues、readList 等所有读取方产生大量无关类型错误。
 
-**Why they differ.** Reading an address is safe at any scope — `getValue` does not
-care which file a value lives in, so `Value<T, SessionScope>` must be usable where
-`Value<T, Scope>` is expected. Forming a transaction is *not* safe at any scope,
-because two files are not atomic, so a commit must pin down exactly one.
+单作用域提交应通过：
 
-Enforcement therefore belongs where transactions are formed, not where addresses
-are read. `setValue<T, Sc>(address: Value<T, Sc>, …): Write<Sc>` is the bridge: it
-infers the scope from a covariant address and stamps it onto an invariant write.
-
-> **Getting this wrong is expensive.** Making addresses invariant too breaks every
-> reader — `getValue`, `scanValues`, `readList` and everything downstream — and
-> produced a 36-error cascade across storage backends that had done nothing wrong.
-> The tempting workaround, making each reader generic over `Sc` to mean "any
-> scope", propagates a type parameter through the whole storage stack to express
-> something variance gives for free.
-
-Verified with `tsc --noEmit --strict`. Reads pass at both scopes:
-
-```ts
-getValue(laneState);        // Value<T, SessionScope>
-getValue(pendingOutput);    // Value<T, EphemeralScope>
-```
-
-Single-scope commits pass:
-
-```ts
+~~~ts
 commit([setValue(laneState, a), setValue(operationState, b)]);
 commit([setValue(toolMemo, m), setValue(pendingOutput, o)]);
 commit([setValue(laneState, a), retireScope("op_1")]);
-```
+~~~
 
-Mixed-scope commits fail, and are the *only* things that fail:
+混合作用域提交必须失败：
 
-```ts
-commit([setValue(laneState, a), setValue(pendingOutput, o)]);   // ERROR
-commit([setValue(pendingOutput, o), retireScope("op_1")]);      // ERROR
-```
+~~~ts
+commit([setValue(laneState, a), setValue(pendingOutput, o)]); // 错误
+commit([setValue(pendingOutput, o), retireScope("op_1")]); // 错误
+~~~
 
-### 6.1 What the type system cannot catch
+两个不同临时作用域的 ID 都属于 Write<EphemeralScope>，类型系统无法区分它们。提交时仍需运行时比较所有写入的 scopeId；按第 5.1 节的现有约束，这个断言不应在正常路径触发。
 
-Two different ephemeral scopes both type as `Write<EphemeralScope>`, because the id
-is a runtime string (§2). A runtime assertion at commit covers it — compare
-`scopeId` across all writes — and per §5.1 it should never fire.
+## 7. 恢复与清理
 
-## 7. Recovery and sweeping
+打开会话时，和主日志一起枚举 sidecar 并加载；sidecar 中的记录和主日志记录一样参与重放。
 
-On open, enumerate sidecars alongside the main log and load them. Their records
-participate in replay exactly as main-log records do.
+当主日志含有对应的 retireScope 记录，或操作已经不存在时，sidecar 可删除。崩溃造成的尾部截断行为不变：每行自包含，最多丢失最后一条未完整写入的记录。
 
-A sidecar is removed when the main log holds a `retireScope` record for it, or when
-its operation is absent — a crash between commit and unlink. Torn-tail semantics
-are unchanged: each line is self-contained, so a crash mid-write loses exactly the
-trailing line.
+## 8. 序号
 
-## 8. Sequence numbers
+每个作用域拥有独立的序号空间。作用域之外没有任何内容需要和它排序；独立编号也使主日志的 nextSeq 不必计算即将删除的 sidecar 消耗的序号。
 
-Scoped writes get their own sequence space per scope. Nothing outside a scope
-orders against its contents, and keeping them separate means `nextSeq` in the main
-header does not account for numbers consumed by files that will be deleted.
+共享编号会在多个操作结算后留下大间隔，还需要额外持久化高水位线，因此不采用。
 
-Shared numbering would leave large gaps after several operations settled, and the
-high-water mark would need separate persistence.
+## 9. 测量效果
 
-## 9. Measured effect
+使用第 1 节的相同负载：
 
-Same workload as §1:
-
-| | size | of today |
+| 方案 | 大小 | 相对当前 |
 | --- | --- | --- |
-| today, single JSONL | 93.89 MB | — |
-| ops + interned addresses, single JSONL | 5.32 MB | 5.7% |
-| **plus scopes — main log** | **0.06 MB** | **0.06%** |
-| — sidecars, retired on settle | 5.26 MB | peak 0.26 MB per operation |
+| 当前，单 JSONL | 93.89 MB | — |
+| 操作编码与地址 intern，单 JSONL | 5.32 MB | 5.7% |
+| **再加作用域，主日志** | **0.06 MB** | **0.06%** |
+| sidecar，结算时回收 | 5.26 MB | 每个操作峰值 0.26 MB |
 
-The 5.7% figure is **rate-dependent and must not be quoted alone**: it holds at
-2 KB of tool output per checkpoint and inverts above the cap, where a whole-value
-replacement wins.
+5.7% 与采样速率相关，不能脱离条件引用；作用域的结果与速率无关，因为主日志只保留已结算条目。
 
-The scope result is **not** rate-dependent. The main log holds settled entries
-regardless of encoding, and that is the number that governs session file growth.
+## 10. 现有代码需要的改动
 
-## 10. What changes in the existing code
+在 session/values.ts 和 session/types.ts 中新增 SessionScope、EphemeralScope、Scope、两个 phantom type、带作用域参数的 Value 与 ValueList、scopeId、value/list 重载、retireScope，以及保留作用域的 setValue、deleteValue、appendList、deleteList 和 Write。
 
-The compiler finds these for you: once addresses carry a scope and `Write<Sc>` is
-invariant, every site that mixes scopes in one transaction fails to typecheck.
-This list is what a full pass turned up, so you know when you are done.
+需要泛化 CommitDecision<TResult, Sc>、lane.command<TResult, Sc>、Storage.commit<Sc>，并给 Sc 默认值 SessionScope。settleOperation 和 continueOperation 不应泛化。
 
-**New, in `session/values.ts` and `session/types.ts`**
+已提交写入需要携带 scopeId，以便 JsonlStorage 路由。调用点的变化如下：
 
-`SessionScope` / `EphemeralScope` / `Scope`; the two phantoms from §6;
-`Value<T, Sc>` and `ValueList<T, Sc>`; `scopeId` on the address; the `value` /
-`list` overloads; `retireScope`; scope-preserving `setValue` / `deleteValue` /
-`appendList` / `deleteList`; `Write<Sc>` with entries, usage and retirement
-session-only by construction.
-
-**Generified**
-
-`CommitDecision<TResult, Sc>`, `lane.command<TResult, Sc>`, `Storage.commit<Sc>`.
-Give `Sc` a default of `SessionScope`: conditional types are not inference sites,
-so without a default a mixed array falls back to the constraint `Scope` and every
-call site fails. `settleOperation` and `continueOperation` stay **non**-generic —
-see §5.
-
-**Committed writes**
-
-`CommittedScopeRetireWrite`, and `scopeId` carried through the committed shapes so
-`JsonlStorage` can route on it.
-
-**Call sites that must change** — each currently mixes scopes in one transaction:
-
-| site | what it does today | what it becomes |
+| 位置 | 当前行为 | 新行为 |
 | --- | --- | --- |
-| `drive/terminal.ts` `operationCleanupWrites` | enumerates tool memos and tool outputs via `scanValues`, deletes each alongside session deletes | one `retireScope(operationId)`; two of its four scans disappear |
-| `drive/response.ts` (settle) | `deleteList(pendingAssistantOutput)` bundled with operation state | drop it — the sidecar is discarded at retire |
-| `drive/deferred.ts` (superseded response) | same | same |
-| `drive/tools.ts` (tool settle) | `deleteValue(pendingToolOutput)` plus memo deletes in a session write array | drop them |
-| `drive/tool-placement.ts` | `deleteValue(pendingToolOutput)` | drop it |
+| drive/terminal.ts | 扫描并删除 tool memo/output | 一次 retireScope(operationId) |
+| drive/response.ts | 结算时删除 pending assistant output | 由 sidecar 回收承担 |
+| drive/deferred.ts | 删除被替代响应的 pending output | 由 sidecar 回收承担 |
+| drive/tools.ts | 在 Session 写入集合中删除临时值 | 删除这些操作 |
+| drive/tool-placement.ts | 删除 pending tool output | 删除此操作 |
 
-The pattern is the same everywhere: **intra-operation cleanup of ephemeral state
-is impossible**, because those commits also write operation and lane state. The
-sidecar is discarded wholesale at retire. The cost is that a multi-turn operation
-holds superseded pending output until settle — bounded by turns, and never
-reaching the main log.
+存储层需要在 JsonlStorage.commit 中按作用域路由、断言一个事务只有一个作用域 ID、提交后按回收记录 unlink，并在打开时加载和清理 sidecar。内存后端按作用域维护 Map；SQLite 使用 scope 列执行删除。
 
-**Storage**
+旧清理写入集合相关测试会失败，需要更新为新的 retireScope 语义。这是实现变化，不是回归。
 
-Sidecar routing in `JsonlStorage.commit` (assert one scope id per transaction,
-route the append), unlink on a `scope` record **after** the commit, and an
-open-time sweep that loads sidecars and removes any the main log already retired.
-In-memory drops a `Map` keyed by scope id; SQLite issues one
-`DELETE ... WHERE scope = ?` and treats a retire record as a no-op, because it has
-no sidecar and the terminal transaction deletes the scoped values explicitly.
+## 11. 列表标签与停止条件
 
-**Expected test churn**
+第 1 步中的跟踪状态以操作批次列表保存。恢复时需要从最近一次 base 批次开始读取，但当前 ListReadOptions 只有 cursor、order、limit，无法表达这一点。
 
-Nine tests assert the old cleanup write set and will fail — `drive-terminal` (3),
-`drive-retry-deferred` (2), `drive-tools`, `drive-reconcile`, `drive-generation`,
-and one pinning reserved namespaces. They expect six or seven individual deletes
-where the new code emits fewer plus one `retireScope`. That is the change landing,
-not a regression.
+BranchScan 已有相同能力，列表应使用 stopAtTag 和 tag：
 
-## 11. List tags and stop conditions
-
-Tracked state is stored as a list of op batches (`delta.md` §9). Recovery needs "the
-batches since the last base batch" without unpacking every row, which lists cannot
-express today: `ListReadOptions` has `cursor`, `order` and `limit` only.
-
-`BranchScan` already solves the same problem for entries, and its vocabulary is
-the one to copy — `stopAtType` / `stopAtId` for a terminator, plain field names
-for a filter.
-
-```ts
+~~~ts
 appendList<T, Sc>(address: ValueList<T, Sc>, element: T, tag?: string): ListAppendWrite<Sc>;
 
 export interface ListElement<T> {
@@ -414,161 +247,56 @@ export interface ListReadOptions {
   cursor?: ListCursor;
   order?: "asc" | "desc";
   limit?: number;
-  /** Include elements up to and including the first carrying this tag, then stop. */
-  stopAtTag?: string;
-  /** Return only elements carrying this tag. */
-  tag?: string;
+  stopAtTag?: string; // 包含首个带该标签的元素，然后停止
+  tag?: string; // 只返回带该标签的元素
 }
-```
+~~~
 
-**`stopAtTag` is a stop condition within a page, not a guarantee.** It can only end
-a page earlier than `limit` would; it never overrides it. If the tagged element is
-not in the page, the consumer sees no tagged element and pages again with the
-cursor — the same loop `readAssistantFrames` already runs. There is no ordering
-question between the two bounds and no "not found" error.
+stopAtTag 只是页内停止条件，不保证整个列表中一定找到标签；如果本页没有标签，消费者使用 cursor 继续分页。readList 必须返回每个元素的 tag，否则消费者无法区分因为标签停止还是因为达到 limit。
 
-For that loop to work, `readList` must return the tag on each element. Otherwise a
-consumer cannot tell "page ended at the tag" from "page ended at the limit"
-without parsing the value, which is the thing the tag exists to avoid.
+标签由生产者写入，因为生产者已经知道批次是否为 base；存储层不得解析元素来推导标签。标签存储在记录中，与 seq 和 value 并列：
 
-**The producer sets the tag, not storage.** For a tracked value the caller
-already knows, because `isBase(ops)` is a token comparison on the first op
-(`delta.md` §2):
+~~~json
+["l",7,9,[["r",{}]],"base"]
+~~~
 
-```ts
-const ops = tracker.flush();
-if (ops.length === 0) return;
-writes: [appendList(address, enc.encode(ops), isBase(ops) ? "base" : undefined)];
-```
+SQLite 增加 tag 列并执行真实谓词；JSONL 和内存后端可直接扫描已加载的列表。该原语也适用于其他需要读取“上次检查点之后的尾部”的列表。
 
-Storage must never inspect an element to derive a tag. That is what keeps op
-batches opaque to the storage layer, and it is the same property that makes
-`EntryScan.type` work: the discriminant is a stored column, not something derived
-from the payload.
+## 12. JSONL 记录编码
 
-**The tag lives on the storage record**, beside `seq` and `value`:
+编码有两个独立层次的字典：地址字典作用于记录的 namespace 加 key，路径字典作用于 value 内部的操作路径。两者使用相同技巧，但不能混为一谈。
 
-```jsonc
-["l",7,9,[["r",{…}]],"base"]        // per §12.1
-```
+### 12.1 记录
 
-Storage must never parse an element to evaluate a predicate. That is what keeps
-ops opaque to storage and the durable path free of domain knowledge
-(`harness-tools.md` §7.7). It is also why `EntryScan.type` works: the discriminant
-is a stored column, not something derived from the payload.
+~~~text
+["@", addrId, namespace, key]              地址定义
+["v", addrId, seq, wireOps]                value 写入，WireOp[]
+["l", addrId, seq, element, tag?]          列表追加
+["x", addrId, seq]                         删除 value 或 list
+["!", addrId, seq]                         回收临时作用域
+~~~
 
-`order` stays `"asc" | "desc"` rather than `BranchScan`'s
-`"newestFirst" | "oldestFirst"`. Branch order is semantic — a walk from a tip
-through a tree. List order is over `seq`. Borrowing the branch words would imply a
-traversal that is not happening.
+记录动词和操作动词属于不同层级，必须保持可区分。用 ! 表示回收而不是 r，因为 r 已经是 delta 的 replace 操作。
 
-Backends: SQLite gets a `tag` column and a real predicate. JSONL holds the list in
-memory already, so it scans backwards and checks a field — no worse than today.
-In-memory likewise.
+条目和 usage 行保持现有 keyed 形式。地址在第二次使用时定义，以避免只写一次的地址承担额外定义开销。
 
-The primitive generalises past frames: any list wanting "the tail since the last
-checkpoint" gets it.
+### 12.2 示例
 
-## 12. JSONL record encoding
+当前四次写入约 1250 字节；使用地址与路径两个字典后约 547 字节。base 批次只略微变小，增量状态从完整对象变为变更字段后，后续转换批次可缩小约 8 倍。
 
-Two dictionaries at two layers. They are the same trick and are independent: the
-**address** dictionary is over `namespace` + `key` on the record; the **path**
-dictionary is over paths *inside* a value's ops (`delta.md` §4).
+记录中的第一个数字是地址 ID；WireOp 中的数字是值内部的路径 ID。两者处于不同层级，分别由独立字典维护。
 
-### 12.1 Records
+不要把示例中的 44% 当作文件级固定收益。字典定义会摊销，transcript 条目也不变；真实收益取决于操作状态写入所占比例。
 
-```
-["@", addrId, namespace, key]              address definition
-["v", addrId, seq, wireOps]                value write   — WireOp[], delta.md §4
-["l", addrId, seq, element, tag?]          list append   — element is WireOp[]
-                                             for a tracked value
-["x", addrId, seq]                         delete (value or list)
-["!", addrId, seq]                         retire an ephemeral scope
-```
+### 12.3 读取
 
-**Record verbs and op verbs are separate vocabularies read at different levels**,
-but they must not look alike. `!` rather than `r` for retire: `r` is delta's
-replace op, and a reader scanning a file should not have to remember which nesting
-level they are at to know what a tuple means.
+读取器在重放时同时建立两个字典。尾部截断只会丢失尾部记录，不需要重写头部；快照重写则重新建立字典并自然输出定义。
 
-Retire takes an address id like everything else, defined by an `["@", id, …]`
-whose namespace is the scope. That keeps one interning rule for the whole file
-rather than a special case for one record.
+引用了尚未定义的 addrId 表示文件损坏，而不是可恢复状态。路径 ID 的定义和首次使用在同一条记录中，因此不会出现对应缺失。
 
-Entries and usage rows keep their current keyed form: they are written once, never
-repeat an address, and are read by machinery that has nothing to do with ops.
+## 13. 待决问题
 
-An address is defined on its **second** use, matching path interning — a
-definition is pure overhead for an address written once, and a session has many of
-those.
-
-### 12.2 Worked example
-
-Four writes across two addresses, before and after.
-
-```jsonc
-// today — 1250 bytes
-{"kind":"value","op":"set","seq":7,"namespace":"pi.op.state","key":"01a04cf6-…","value":{"at":"starting","control":{…},"settings":{…},"latestAssistantEntryId":null}}
-{"kind":"value","op":"set","seq":8,"namespace":"pi.lane.state","key":"main","value":{"currentOperationId":"01a04cf6-…",…}}
-{"kind":"value","op":"set","seq":9,"namespace":"pi.op.state","key":"01a04cf6-…","value":{"at":"checkpoint",…}}
-{"kind":"value","op":"set","seq":12,"namespace":"pi.op.state","key":"01a04cf6-…","value":{"at":"assistant.ready",…}}
-```
-
-```jsonc
-// with both dictionaries — 547 bytes
-["@",0,"pi.op.state","01a04cf6-…"]
-["v",0,7,[["r",{"at":"starting","control":{…},"settings":{…},"latestAssistantEntryId":null}]]]
-["@",1,"pi.lane.state","main"]
-["v",1,8,[["r",{"currentOperationId":"01a04cf6-…",…}]]]
-["v",0,9,[["#",0,["at"]],["s",0,"checkpoint"]]]
-["v",0,12,[["s","assistant.ready"]]]
-```
-
-| line | before | after |
-| --- | --- | --- |
-| address definition | – | 61 |
-| op.state -> `starting` (base batch) | 353 | 256 |
-| address definition | – | 31 |
-| lane.state (base batch) | 181 | 114 |
-| op.state -> `checkpoint` | 355 | **48** |
-| op.state -> `assistant.ready` | 361 | **37** |
-| **total** | **1250** | **547** (44%) |
-
-The shape matters more than the total. Base batches barely shrink — 353 to 256 is
-envelope only, since the value ships whole either way. The transitions collapse
-~8x because they carry one changed field instead of the whole state including the
-never-changing `settings` block.
-
-Both dictionaries appear on line 5: `0` in `["v",0,9,…]` is an **address** id,
-while `["#",0,["at"]]` defines a **path** id inside the value's ops. Same trick,
-different layers, separate tables. Line 6 then drops the path entirely — arity
-omission, because it targets the same path as the previous op in that batch.
-
-**Do not quote 44% as the file-level saving.** Dictionary entries are one-time, so
-a real operation's ~11 op.state writes amortise them and the ratio improves; but
-transcript entries are untouched, and they were 18 KB of a 67 KB tool-heavy run.
-Applied there this hits the ~27 KB of value writes and would take the file down by
-roughly a fifth, not by half.
-
-### 12.3 Reading
-
-A reader builds both tables while replaying, so a torn tail costs exactly the
-trailing lines and no header needs rewriting. A snapshot rewrite starts fresh
-tables and re-emits definitions naturally.
-
-A numeric `addrId` for which no definition has been seen is a corrupt file, not a
-recoverable state — unlike a missing path id, which cannot occur because path
-definitions are inside the same record as their first use.
-
-## 13. Open questions
-
-- File-handle pressure across concurrent lanes, each with a live sidecar. Probably
-  fine, unmeasured.
-- fsync policy for sidecars (§4) — matched to the main log, or relaxed given the
-  contents are bounded-loss scaffolding.
-- Whether a long-running operation should rotate its sidecar. `rebase()`
-  (`delta.md` §3.2.3) bounds *recovery* length but not file size, so a command
-  running for hours still grows its sidecar without bound.
-- Whether an in-place compaction pass for the main log is worth building anyway.
-  `createFromSnapshot` plus atomic replace is the mechanism; scopes reduce the need
-  but do not remove it, since superseded session-scoped values still accumulate.
+- 多个并发 lane 各自持有 sidecar 时的文件句柄压力，尚未测量；
+- sidecar 的 fsync 策略，是与主日志一致还是接受更宽松的有限丢失；
+- 长时间运行的操作是否需要轮换 sidecar；rebase 可以限制恢复长度，但不能限制文件大小；
+- 是否仍需要主日志原地压缩。createFromSnapshot 加原子替换仍可作为机制，因为作用域只减少了需求，不能消除已被替代的 Session 值累积。

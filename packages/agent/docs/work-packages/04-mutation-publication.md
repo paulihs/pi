@@ -1,16 +1,16 @@
-# WP04 — Mutation publication and event delivery
+# WP04 — Mutation 发布和事件交付
 
-## Status
+## 状态
 
-Complete. Phase A and the final implementation rereview passed Fable with no findings. Focused agent/server/SQLite tests, `npm run build`, `npm run check`, and `./test.sh` pass. `packages/agent/docs/harness.md` remains normative.
+已完成。Phase A 和最终实现复审通过 Fable，没有发现问题。聚焦的 agent/server/SQLite 测试、`npm run build`、`npm run check` 和 `./test.sh` 均通过。`packages/agent/docs/harness.md` 仍是规范文档。
 
-> Historical note: WP06 later replaced the lane-creation API and keyed line described in this completed handoff with atomic `AgentHarness.lane()` acquisition on one Session line. The event-publication guarantees remain current.
+> 历史说明：WP06 后来用单条 Session line 上原子获取 `AgentHarness.lane()` 替换了本已完成 handoff 中描述的 lane-creation API 和 keyed line。事件发布保证仍然有效。
 
-WP02 established atomic acceptance, recipient binding, and coherent lane watches. WP03 removed drive deadlines. WP04 removes the caller-operated event-delivery gate without weakening those guarantees and makes the historical `Session.createLane()` own lane creation end to end. The direct durable-drive package follows as WP05.
+WP02 建立了原子 acceptance、recipient binding 和一致的 lane watch。WP03 移除了 drive deadline。WP04 在不削弱这些保证的前提下，移除由调用者操作的事件交付 gate，并让历史 `Session.createLane()` 从头到尾拥有 lane 创建。直接持久 drive package 随后作为 WP05。
 
-## Problem
+## 问题
 
-A committing lane job currently uses a two-part event API:
+当前 committing lane job 使用两段式事件 API：
 
 ```text
 inside Session.mutate:
@@ -22,17 +22,17 @@ outside Session.mutate:
   await delivery.start()
 ```
 
-The split preserves the correct boundary, but it is a footgun: calling `emit()` too early, calling `start()` too early, or dropping `start()` can violate observation semantics or stall the global event tail. The historical `Harness.createLane()` repeats the choreography manually.
+拆分保留了正确边界，但也容易误用：过早调用 `emit()`、过早调用 `start()` 或丢弃 `start()`，都可能破坏 observation 语义或阻塞全局 event tail。历史 `Harness.createLane()` 还会手动重复这套编排。
 
-Lane creation has a second one-off boundary. The historical `Session.createLane()` owns validation and the durable transaction, but Harness cannot publish its process-local `Lane` and bind `lane_created` recipients from that same commit continuation. Harness therefore opens `Session.mutate()` itself and calls exported `createLaneWithMutator()`.
+Lane 创建还有第二个一次性边界。历史 `Session.createLane()` 负责 validation 和 durable transaction，但 Harness 无法在同一个 commit continuation 中发布其 process-local `Lane` 并绑定 `lane_created` recipient。因此 Harness 自己打开 `Session.mutate()`，并调用导出的 `createLaneWithMutator()`。
 
-WP04 removes both caller-operated seams while preserving current direct-listener and hook barriers.
+WP04 移除这两个由调用者操作的接缝，同时保留当前 direct-listener 和 hook barrier。
 
-## Required semantics
+## 必需语义
 
-### Direct events remain awaited observations
+### Direct event 仍然是等待中的 observation
 
-Direct `events.on()` listeners remain passive but causally ordered:
+直接 `events.on()` listener 仍是被动且有因果顺序的：
 
 ```text
 hook or preparation
@@ -45,19 +45,19 @@ hook or preparation
 → later hook or transition
 ```
 
-Passive means a listener cannot transform the in-flight operation and listener failures are isolated as `handler_error`. It does not mean fire-and-forget. An extension may update process-local state in an event listener and inspect it from a later hook. Awaiting also supplies producer backpressure.
+被动意味着 listener 不能转换正在进行的操作，listener 失败会作为 `handler_error` 隔离；不意味着 fire-and-forget。Extension 可以在 event listener 中更新进程本地状态，并在后续 hook 中检查它。等待也提供 producer backpressure。
 
-A direct listener must not call a state-mutating harness API: an emitted mutation would queue a later event behind the event currently awaiting that listener. Read-only lane calls remain legal.
+Direct listener 不得调用会修改状态的 Harness API：发出的 mutation 会把后续 event 排在当前正在等待该 listener 的 event 之后。只读 lane call 仍然合法。
 
-Deliberate exceptions remain unchanged:
+以下有意保留的例外不变：
 
-- watchers and RPC/watch consumers use their own buffered FIFO and are not awaited by operations;
-- fault publication is fire-and-forget, and close never waits for listener completion;
-- high-frequency tool updates enqueue every event and retain only the latest delivery promise; tool settlement awaits that promise before `after_tool` and outcome publication, which drains all earlier updates through global FIFO without per-update backpressure.
+- watcher 和 RPC/watch consumer 使用自己的 buffered FIFO，operation 不等待它们；
+- fault publication 采用 fire-and-forget，close 永远不等待 listener 完成；
+- 高频 tool update 会入队每个 event，但只保留最新的 delivery promise；tool settlement 在 `after_tool` 和 outcome publication 前等待该 promise，通过 global FIFO 排空所有更早 update，但不对每次 update 施加 backpressure。
 
-### Commit and recipient binding remain one continuation
+### Commit 和 recipient binding 仍在一个 continuation 中
 
-Every event-producing committing lane job performs, in the exact continuation that observes successful commit:
+每个产生事件的 committing lane job 都在观察到 commit 成功的**同一个 continuation**中执行：
 
 ```text
 commit succeeds
@@ -69,11 +69,11 @@ commit succeeds
 → return from the mutation callback
 ```
 
-There is no scheduler-owned after-release publication phase. Moving recipient binding into a later promise continuation creates a gap in which another task may observe committed state and register a listener before the old event binds recipients.
+不存在 scheduler-owned 的 after-release publication phase。把 recipient binding 移到后续 promise continuation 会产生一个间隙：另一个 task 可能观察到已提交状态，并在旧 event 绑定 recipient 之前注册 listener。
 
-`emitBatch()` starts asynchronous delivery immediately and returns its completion promise. The mutation callback never awaits that promise. Listener code may begin after publication/binding but before the mutation line technically releases; a reentrant lane read queues behind the current job. The command carries the promise out of `Session.mutate()` and awaits it before resolving publicly.
+`emitBatch()` 会立即开始异步交付并返回完成 promise。Mutation callback 不会等待该 promise。Listener 可能在 publication/binding 后、mutation line 技术上释放前开始执行；重入的 lane read 会排在当前 job 后面。Command 将 promise 带出 `Session.mutate()`，并在对外 resolve 前等待它。
 
-This preserves the two legal watcher races:
+这保留两种合法的 watcher 竞态：
 
 ```text
 watcher registration first
@@ -83,20 +83,20 @@ commit publication first
 → snapshot-after + no old event
 ```
 
-### Ordering
+### 排序
 
-- One non-empty `emitBatch()` call publishes one contiguous batch.
-- Batches enter the existing global event tail in `emitBatch()` invocation order, including across lanes.
-- Events within a batch retain source order.
-- Direct listeners run serially in registration order.
-- Same-lane committing jobs bind batches in lane mutation order.
-- A lane procedure awaits each command's delivery before invoking its next hook or transition.
-- Hooks on unrelated lanes may overlap; there is no total cross-lane hook order.
-- Context remains the exact emitting invocation Context and is always the final parameter.
+- 一次非空 `emitBatch()` 调用发布一个连续 batch；
+- batch 按 `emitBatch()` 调用顺序进入既有 global event tail，跨 lane 也一样；
+- batch 内 event 保留源顺序；
+- Direct listener 按注册顺序串行运行；
+- 同一 lane 的 committing job 按 lane mutation 顺序绑定 batch；
+- Lane procedure 在调用下一 hook 或 transition 前等待当前 command 的 delivery；
+- 不相关 lane 上的 hook 可以重叠，不存在跨 lane 的全局 hook 顺序；
+- Context 保持为精确的 emitting invocation Context，且始终是最后一个参数。
 
-## Event bus contract
+## Event bus 契约
 
-Replace the public/internal delivery split with:
+用以下内容替换公开/内部交付拆分：
 
 ```ts
 class HarnessEventBus implements Events {
@@ -105,30 +105,30 @@ class HarnessEventBus implements Events {
 }
 ```
 
-`emitBatch()`:
+`emitBatch()`：
 
-1. returns an already-resolved promise for an empty batch or a closed bus;
-2. synchronously structured-clones every payload and binds its current recipients;
-3. appends one contiguous delivery to the existing global tail;
-4. delivers cloned payloads serially with the emitting Context;
-5. isolates listener failures and publishes non-recursive `handler_error` as today;
-6. returns a promise that resolves after eligible direct listeners settle and never rejects because a listener failed.
+1. 对空 batch 或已关闭 bus 返回已 resolve 的 promise；
+2. 同步对每个 payload 做 structured clone，并绑定当前 recipient；
+3. 将一个连续 delivery 追加到已有 global tail；
+4. 使用 emitting Context 串行交付 clone 后的 payload；
+5. 隔离 listener 失败，并像现在一样发布非递归的 `handler_error`；
+6. 返回一个在 eligible direct listener settle 后 resolve 的 promise，且不会因 listener 失败而 reject。
 
-Synchronous publication defects such as an uncloneable internal payload still throw in the caller's commit continuation and follow the existing harness-fault path.
+同步 publication defect（例如无法 clone 的内部 payload）仍会在 caller 的 commit continuation 中抛出，并沿用现有 Harness fault path。
 
-Delete:
+删除：
 
-- `HarnessEventDelivery`;
-- `HarnessEventBus.enqueue()`;
-- caller-operated `start()`;
-- delivery gates and `pendingStarts`;
-- close-time forced gate release.
+- `HarnessEventDelivery`；
+- `HarnessEventBus.enqueue()`；
+- 调用者操作的 `start()`；
+- delivery gate 和 `pendingStarts`；
+- close 时强制释放 gate。
 
-`close(error)` seals listener/watch registration and future publication immediately. Already appended batches retain their bound recipients and drain through the existing tail; listener completion still does not block Harness close.
+`close(error)` 立即封闭 listener/watch registration 和未来 publication。已经追加的 batch 保留其绑定 recipient，并通过已有 tail drain；listener 完成仍不阻塞 Harness close。
 
-## Lane command integration
+## Lane command 集成
 
-The commit branch of `Lane.command()` returns a plain internal outcome containing the caller result and optional delivery promise:
+`Lane.command()` 的 commit 分支返回普通内部 outcome，其中包含 caller result 和可选 delivery promise：
 
 ```ts
 const events = decision.events?.(commit) ?? [];
@@ -143,9 +143,9 @@ return {
 };
 ```
 
-`onEvent` returns `Promise<void>` and delegates to `emitBatch()`. It is called only after commit, complete process-local state publication, and synchronous result materialization, as the final action before returning the mutation outcome.
+`onEvent` 返回 `Promise<void>` 并委托给 `emitBatch()`。它只在 commit、完整 process-local state publication 和同步 result materialization 完成之后调用，作为返回 mutation outcome 前的最后动作。
 
-After `Session.mutate()` returns:
+`Session.mutate()` 返回之后：
 
 ```ts
 if (outcome.kind === "reject") throw outcome.error;
@@ -153,11 +153,11 @@ await outcome.delivery;
 return outcome.result;
 ```
 
-Expected no-commit rejections publish no events. Commit/materialization/publication errors retain the existing harness-fault semantics.
+预期的 no-commit rejection 不发布 event。Commit/materialization/publication error 保留现有 Harness fault 语义。
 
-## Session lane creation contract
+## Session lane 创建契约
 
-The historical `Session.createLane()` owns validation, commit, and the synchronous committed-publication callback. Context remains last:
+历史 `Session.createLane()` 负责 validation、commit 和同步 committed-publication callback。Context 仍在末尾：
 
 ```ts
 createLane(
@@ -169,7 +169,7 @@ createLane(
 ): Promise<SessionTree>;
 ```
 
-The implementation performs:
+实现执行：
 
 ```text
 enter the prospective lane's mutation line
@@ -182,13 +182,13 @@ enter the prospective lane's mutation line
 → return Session.view(name)
 ```
 
-The callback receives neither `SessionTree` nor `SessionMutator`. It is only the process-local publication point. Its synchronous prefix must complete the publication needed before another same-lane job can run. Ordinary Session callers pass `undefined`.
+Callback 既不接收 `SessionTree`，也不接收 `SessionMutator`；它只是 process-local publication point。其同步前缀必须完成在另一个同 lane job 运行前所需的 publication。普通 Session caller 传 `undefined`。
 
-If validation or commit fails, the callback is not invoked. If the callback throws after commit or its retained promise rejects after line release, the durable lane remains and the caller rejects; Harness converts that committed-publication defect to its existing fault path. A promise returned by the Harness callback is event delivery, whose listener failures are isolated by the bus.
+如果 validation 或 commit 失败，不调用 callback。如果 callback 在 commit 后抛出，或保留的 promise 在线释放后 reject，durable lane 保留但 caller reject；Harness 将这个 committed-publication defect 转换为现有 fault path。Harness callback 返回的 promise 是 event delivery，listener 失败会由 bus 隔离。
 
-The current lane validation/transaction implementation becomes private to Session. Delete exported `createLaneWithMutator()` and its direct tests.
+当前 lane validation/transaction implementation 变为 Session 私有。删除导出的 `createLaneWithMutator()` 及其直接测试。
 
-Harness preconstructs a detached `Lane`, then calls Session:
+Harness 预先构造 detached `Lane`，然后调用 Session：
 
 ```ts
 const lane = this.buildLane(name, state);
@@ -211,97 +211,97 @@ await this.session.createLane(
 return Result.ok(lane);
 ```
 
-The callback's synchronous prefix publishes `lanesByName` and binds `lane_created` before the first creation job releases its line. A queued duplicate therefore cannot report `LaneExists` before the winner is visible through `harness.lane(name)`.
+Callback 的同步前缀会发布 `lanesByName`，并在第一个创建 job 释放其 line 前绑定 `lane_created`。因此排队的 duplicate 不会在 winner 通过 `harness.lane(name)` 可见前报告 `LaneExists`。
 
-If close or fault wins while commit is admitted, the callback publishes the new Lane sealed. Emission on the already-closed bus is a resolved no-op, matching the existing admitted-creation race. The successful admitted creation still returns its sealed Lane.
+如果 close 或 fault 在 commit 已准入时胜出，callback 会发布 sealed 的新 Lane。已关闭 bus 上的 emission 是 resolved no-op，与现有 admitted-creation race 一致。成功的 admitted creation 仍返回 sealed Lane。
 
-## Scope
+## 范围
 
-### Source
+### 源码
 
-Modify:
+修改：
 
-- `packages/agent/src/harness/events.ts`;
-- `packages/agent/src/harness/runtime2/lane.ts`;
-- `packages/agent/src/harness/runtime2/harness.ts`;
-- `packages/agent/src/harness/session/types.ts`;
-- local Session implementations and tests required by the historical `createLane` signature;
-- direct event primitive, acceptance, watch, lane, and harness tests.
+- `packages/agent/src/harness/events.ts`；
+- `packages/agent/src/harness/runtime2/lane.ts`；
+- `packages/agent/src/harness/runtime2/harness.ts`；
+- `packages/agent/src/harness/session/types.ts`；
+- 历史 `createLane` signature 所需的本地 Session 实现和测试；
+- direct event primitive、acceptance、watch、lane 和 harness 测试。
 
-Remote/experimental runtime behavior is not a design constraint for WP04. Session mutation authority remains process-local; do not add remote Session callback transport, protocol machinery, compatibility abstractions, or boundary tests.
+Remote/experimental runtime behavior 不是 WP04 的设计约束。Session mutation authority 保持进程本地；不要添加 remote Session callback transport、protocol machinery、compatibility abstraction 或 boundary test。
 
-### Documentation
+### 文档
 
-Update normative `harness.md`:
+更新规范 `harness.md`：
 
-- replace enqueue/start language with synchronous `emitBatch` binding and post-mutation awaiting;
-- state accurately that listener execution may begin after publication/binding but before technical line release;
-- retain awaited direct-listener, event/hook, watcher, Context, close, and ordering semantics;
-- replace shared exported mutator-procedure lane creation with the historical `Session.createLane(onCommitted, context)`;
-- update invariants, races, tests, glossary, and Part 8;
-- link WP04 and move direct durable drive to WP05.
+- 用同步 `emitBatch` binding 和 mutation 后等待替换 enqueue/start 语言；
+- 准确说明 listener execution 可以在 publication/binding 后、技术上的 line release 前开始；
+- 保留 awaited direct-listener、event/hook、watcher、Context、close 和 ordering 语义；
+- 用历史 `Session.createLane(onCommitted, context)` 替换共享导出的 mutator-procedure lane creation；
+- 更新不变量、竞态、测试、术语表和 Part 8；
+- 链接 WP04，并将 direct durable drive 移到 WP05。
 
-Update the historical WP02 handoff only where it points forward or claims the old mechanism remains current. Do not rewrite its completed-package record as though WP04 behavior landed in WP02.
+只在历史 WP02 handoff 指向未来或声称旧机制仍然有效的地方更新它。不要把已完成包的记录重写成 WP04 行为已经在 WP02 落地。
 
-## Non-goals
+## 非目标
 
-- fire-and-forget direct events or a public flush API;
-- sequence/watermark delivery redesign;
-- per-extension event queues;
-- changing hook aggregation or event/hook causal barriers;
-- changing watcher/RPC buffering;
-- changing tool-update settlement barriers;
-- making event-listener mutation safe;
-- drive, breakpoints, providers, tools, recovery, retries, polling, abort, or terminal settlement;
-- generic Session post-commit/after-release task APIs;
-- remote callback execution or remote-runtime redesign.
+- fire-and-forget direct event 或公开 flush API；
+- sequence/watermark delivery redesign；
+- per-extension event queue；
+- 更改 hook aggregation 或 event/hook causal barrier；
+- 更改 watcher/RPC buffering；
+- 更改 tool-update settlement barrier；
+- 让 event-listener mutation 安全；
+- drive、breakpoint、provider、tool、recovery、retry、polling、abort 或 terminal settlement；
+- 通用 Session post-commit/after-release task API；
+- remote callback execution 或 remote-runtime redesign。
 
-## Required tests
+## 必需测试
 
-### Event primitives
+### Event primitive
 
-- `emitBatch` binds ordinary listeners and watchers synchronously;
-- a listener registered after `emitBatch` but before delayed delivery receives nothing;
-- a complete batch is contiguous and preserves event order;
-- concurrent batch publication preserves invocation order;
-- listener payload mutation remains isolated;
-- listener rejection emits one non-recursive `handler_error` and does not reject delivery;
-- empty and post-close batches resolve without delivery;
-- already appended batches drain after close;
-- no gate/start tests remain.
+- `emitBatch` 同步绑定 ordinary listener 和 watcher；
+- `emitBatch` 后、延迟 delivery 前注册的 listener 不会收到内容；
+- 完整 batch 连续且保留 event order；
+- 并发 batch publication 保留调用顺序；
+- listener payload mutation 保持隔离；
+- listener rejection 发出一次非递归 `handler_error`，且不 reject delivery；
+- 空 batch 和 close 后 batch 无 delivery 也能 resolve；
+- 已追加 batch 在 close 后仍能 drain；
+- 不再保留 gate/start test。
 
-### Lane commands and watch
+### Lane command 和 watch
 
-- direct listeners may perform reentrant read-only lane inspection without deadlock;
-- a command does not resolve until its direct listeners finish;
-- committed memory is visible to listeners;
-- commit failure publishes nothing;
-- a late listener that observes durable state receives no historical event;
-- watcher-first yields snapshot-before plus the complete buffered batch;
-- publication-first yields snapshot-after without replay;
-- source Context identity survives delayed and buffered delivery.
+- direct listener 可以重入执行只读 lane inspection，且无 deadlock；
+- command 直到 direct listener 完成才 resolve；
+- listener 能看到已提交的 memory；
+- commit failure 不发布任何内容；
+- 观察 durable state 的 late listener 不会收到历史 event；
+- watcher-first 产生 snapshot-before 加完整 buffered batch；
+- publication-first 产生 snapshot-after，不 replay；
+- source Context identity 在延迟和 buffered delivery 中保持。
 
-### Lane creation
+### Lane 创建
 
-- Session callback runs exactly once after successful commit and never on validation/commit failure;
-- callback synchronous publication occurs before a queued duplicate reports `LaneExists`;
-- Harness Lane and durable configuration are visible to `lane_created` listeners;
-- Harness waits for asynchronous `lane_created` listeners before resolving;
-- admitted creation racing close publishes a sealed Lane and does not require event delivery;
-- callback throw and retained-promise rejection after commit follow the documented committed-publication failure path;
-- ordinary Session creation with `undefined` returns its view;
-- no exported `createLaneWithMutator` remains.
+- Session callback 在成功 commit 后恰好运行一次，validation/commit failure 时永不运行；
+- callback 的同步 publication 发生在 queued duplicate 报告 `LaneExists` 前；
+- Harness Lane 和 durable configuration 对 `lane_created` listener 可见；
+- Harness 在 resolve 前等待异步 `lane_created` listener；
+- admitted creation 与 close 竞态时发布 sealed Lane，且不要求 event delivery；
+- commit 后 callback throw 和 retained-promise rejection 遵循文档规定的 committed-publication failure path；
+- 普通 Session creation 传 `undefined` 时返回其 view；
+- 不再存在导出的 `createLaneWithMutator`。
 
-### Ordering barriers
+### Ordering barrier
 
-- acceptance events finish before `accept()` resolves;
-- command resolution cannot overtake its awaited direct event delivery; WP05 tests the first subsequent procedure hook;
-- event batches are globally ordered across concurrent lane publication;
-- tool-update latest-delivery settlement behavior remains unchanged where implemented.
+- acceptance event 在 `accept()` resolve 前完成；
+- command resolution 不能超过其等待的 direct event delivery；WP05 测试第一个后续 procedure hook；
+- event batch 在并发 lane publication 间保持全局顺序；
+- 已实现处的 tool-update latest-delivery settlement 行为保持不变。
 
-## Validation
+## 验证
 
-After documentation:
+文档修改后：
 
 ```bash
 git diff --check -- \
@@ -311,7 +311,7 @@ git diff --check -- \
   packages/agent/docs/work-packages/05-direct-durable-drive.md
 ```
 
-After implementation, run every modified focused test, then:
+实现后运行所有修改过的聚焦测试，然后：
 
 ```bash
 git diff --check
@@ -319,19 +319,19 @@ npm run check
 ./test.sh
 ```
 
-Review the final implementation with Fable before declaring WP04 complete. Do not commit without explicit user approval.
+在宣布 WP04 完成前，用 Fable 审查最终实现。没有用户明确批准不要 commit。
 
-## Stop condition
+## 停止条件
 
-WP04 is complete when:
+满足以下条件时 WP04 完成：
 
-- event publication has one `emitBatch()` operation and no caller-operated gate;
-- recipient binding remains in the exact commit-observation continuation;
-- direct event delivery remains globally FIFO and awaited before public operation resolution;
-- existing event/hook causal barriers remain intact;
-- lane watches retain exactly the two coherent race outcomes;
-- Session owns lane creation and invokes Harness publication before releasing the creation job;
-- `createLaneWithMutator()` is gone;
-- Context is trailing and source-identical throughout;
-- focused tests, `npm run check`, and `./test.sh` pass;
-- final Fable review reports no findings.
+- 事件 publication 只有一个 `emitBatch()` 操作，不再有调用者操作的 gate；
+- recipient binding 仍位于精确的 commit-observation continuation；
+- direct event delivery 保持全局 FIFO，并在公开 operation resolution 前等待；
+- 现有 event/hook 因果 barrier 保持完整；
+- lane watch 保留恰好两种一致的竞态结果；
+- Session 拥有 lane creation，并在释放 creation job 前调用 Harness publication；
+- `createLaneWithMutator()` 已删除；
+- Context 始终位于尾部，且 source identical；
+- 聚焦测试、`npm run check` 和 `./test.sh` 通过；
+- 最终 Fable 审查没有发现。

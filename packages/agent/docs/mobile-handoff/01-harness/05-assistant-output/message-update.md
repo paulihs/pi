@@ -1,24 +1,22 @@
-# `message_update` Write Amplification
+# `message_update` 写放大
 
-> **Scope:** harness-local. Depends on [delta tracking](../01-delta/delta.md) for the landed Chord `Op`/`WireOp` vocabulary and [scoped storage](../02-scopes/scopes.md) for durability. Chord delta tracking has landed; scoped storage and this Harness integration have not.
+> **范围：** Harness 本地。依赖已落地 Chord `Op`/`WireOp` 词汇的 [delta tracking](../01-delta/delta.md)，以及用于持久化的[作用域存储](../02-scopes/scopes.md)。Chord delta tracking 已落地；作用域存储和本 Harness 集成尚未落地。
 
-## 1. The problem
+## 1. 问题
 
 ```ts
 { type: "message_update", runId, message, event, frame? }
 ```
 
-Three representations of the same thing travel together:
+同一内容的三种表示会一起传输：
 
-- `message` — the full `AssistantMessage`;
-- `event` — an `AssistantMessageEvent`, which itself carries `partial: AssistantMessage`,
-  a second full copy;
-- `frame` — the actual delta, optional.
+- `message`——完整的 `AssistantMessage`；
+- `event`——`AssistantMessageEvent`，自身又携带 `partial: AssistantMessage`，即第二份完整副本；
+- `frame`——实际 delta，可选。
 
-Per streamed token this is roughly two complete snapshots plus a delta, so bytes grow
-quadratically over a response.
+每个流式 token 大致包含两个完整快照加一个 delta，因此响应期间字节数呈二次增长。
 
-The reducer does not even use the delta:
+Reducer 甚至不使用 delta：
 
 ```ts
 case "message_update":
@@ -27,13 +25,11 @@ case "message_update":
   }
 ```
 
-A straight assignment. So on any wire, sending the event is *worse* than sending a
-snapshot — it ships two where `replace` ships one.
+只是一次直接赋值。所以在任意 wire 上，发送 event 都比发送快照更差——快照的 `replace` 只发送一份，而 event 会发送两份。
 
-The wire adapter is already halfway to the fix: it drops `event` and sends `message`
-plus `frame`. That is the full snapshot together with the delta that produced it.
+Wire adapter 已经接近修复方案：它丢弃 `event`，发送 `message` 加 `frame`。这就是完整快照与产生它的 delta 一起发送。
 
-## 2. The compact form already exists
+## 2. 紧凑形式已经存在
 
 ```ts
 /**
@@ -47,58 +43,47 @@ export type AssistantMessageFrame =
   | { type: "toolcall_start" | "toolcall_checkpoint" | "toolcall_delta" | "toolcall_end"; ... };
 ```
 
-`AssistantMessageFrameEncoder` produces it, `reduceAssistantMessageFrames` folds it,
-and `openFrameProgress` already persists it with `appendList`. The delta format is
-built, used, and durable. It simply is not what `message_update` carries.
+`AssistantMessageFrameEncoder` 生成它，`reduceAssistantMessageFrames` 折叠它，`openFrameProgress` 已经通过 `appendList` 持久化它。Delta 格式已经构建、使用并持久化，只是 `message_update` 携带的还不是它。
 
-## 3. Precedent
+## 3. 先例
 
-pi already does wire-is-delta one layer down. `PiMessagesEvent` — the serialized form
-a pi-messages backend sends — has no `partial`:
+Pi 在更下一层已经采用 wire-is-delta。`PiMessagesEvent` 是 pi-messages backend 发送的序列化形式，不包含 `partial`：
 
 ```ts
 | { type: "text_delta"; contentIndex: number; delta: string }
 | { type: "text_end"; contentIndex: number; content: string; contentSignature?: string }
 ```
 
-`pi-messages.ts` then rehydrates: it holds a local `partial`, mutates it per event
-(`partial.content[i].text += event.delta`), and returns the in-process
-`AssistantMessageEvent` with `partial` attached.
+随后 `pi-messages.ts` 负责 hydration：它持有本地 `partial`，根据每个事件修改它（`partial.content[i].text += event.delta`），并返回附带 `partial` 的进程内 `AssistantMessageEvent`。
 
-So the convention is established. It just stops at the provider edge instead of
-continuing through the harness.
+因此约定已经建立。它只是停在 provider 边界，没有继续穿过 Harness。
 
-## 4. The change
+## 4. 变更
 
 ```ts
 | { type: "message_update"; runId: string; entryId: string; frame: AssistantMessageFrame }
 ```
 
-`message` and `event` are removed; `frame` stops being optional.
+移除 `message` 和 `event`；`frame` 不再可选。
 
-The blast radius is small because `HarnessEvent` is not what most streaming consumers
-read. `AgentEvent` (`agent-loop.ts`) and `AgentSessionEvent` (`agent-session.ts`) are
-separate unions that happen to share the tag name and build their own
-`message_update` from the pi-ai event directly. They are out of scope here.
+影响范围很小，因为大多数流式消费者并不读取 `HarnessEvent`。`AgentEvent`（`agent-loop.ts`）和 `AgentSessionEvent`（`agent-session.ts`）是两个独立 union，只是碰巧共享 tag 名称，并且直接从 pi-ai event 构造自己的 `message_update`。它们不在本范围内。
 
-Real consumers and producers of `HarnessEvent.message_update`:
+`HarnessEvent.message_update` 的真实消费者和生产者：
 
-| site | change |
+| 位置 | 变更 |
 | --- | --- |
-| `runtime/drive/response.ts` | emit the required semantic frame; stop attaching full snapshots |
-| `runtime/reducer.ts` | fold the frame instead of assigning `event.message` |
-| lane/facet state adapter | run that fold under the Chord tracker and emit `Op[]`/encoded `WireOp[]` |
-| `experimental/harness-wire-adapter.ts` | stop treating raw `HarnessEvent` as the final replication format |
-| `harness/telemetry.ts` | name list only |
-| `protocol/harness.ts` | replication carries encoded `WireOp[]`, not the raw event |
+| `runtime/drive/response.ts` | 发出必需的语义帧；停止附带完整快照 |
+| `runtime/reducer.ts` | 折叠 frame，而不是赋值 `event.message` |
+| lane/facet state adapter | 在 Chord tracker 下执行折叠，并发出 `Op[]`/编码后的 `WireOp[]` |
+| `experimental/harness-wire-adapter.ts` | 不再把原始 `HarnessEvent` 当作最终复制格式 |
+| `harness/telemetry.ts` | 仅用于命名列表 |
+| `protocol/harness.ts` | 复制携带编码后的 `WireOp[]`，而不是原始 event |
 
-`message_end` continues to carry the settled message, because frames deliberately
-exclude terminal settlement. That is once per message, not once per token.
+`message_end` 继续携带已结算消息，因为帧有意排除终端结算。它每条消息一次，而不是每个 token 一次。
 
-## 5. An incremental applier is needed
+## 5. 需要增量应用器
 
-`reduceAssistantMessageFrames` is a whole-stream fold over an `Iterable`. The
-reducer needs a step function:
+`reduceAssistantMessageFrames` 是对 `Iterable` 做的完整流折叠。Reducer 需要一个 step 函数：
 
 ```ts
 export function applyAssistantMessageFrame(
@@ -107,121 +92,75 @@ export function applyAssistantMessageFrame(
 ): void;
 ```
 
-Plain mutation on a plain object. **No `Draft`, no Immer.** An earlier draft
-argued for a draft-mutating signature so it would compose inside a `produce`
-recipe; that motivation is gone ([delta.md §8](../01-delta/delta.md#8-what-this-removes-from-the-codebase)). The step function is still
-needed — the whole-stream version becomes a loop over it — just for the simpler
-reason that the reducer folds one frame at a time.
+在普通对象上做普通 mutation。**不要用 `Draft`，也不要用 Immer。** 早期草稿主张使用 draft-mutating 签名，以便在 `produce` recipe 中组合；该动机已经消失（[delta.md §8](../01-delta/delta.md#8-what-this-removes-from-the-codebase)）。仍然需要 step 函数——完整流版本会循环调用它——理由只是 reducer 要逐帧折叠，设计更简单。
 
-### 5.1 pi-ai frames stay at the pi-ai boundary; Chord ops cross replication boundaries
+### 5.1 pi-ai 帧停留在 pi-ai 边界；Chord 操作跨越复制边界
 
-`AssistantMessageFrame` is pi-ai's semantic delta vocabulary (`text_delta`, `text_end`, …). [Delta tracking §6](../01-delta/delta.md#6-there-is-no-frame-type) defines no second frame wrapper: in-process replication carries `Op[]`, and a wire adapter carries encoded `WireOp[]`. Pi-ai frames stop at the fold; Chord ops cross the replication boundary.
+`AssistantMessageFrame` 是 pi-ai 的语义 delta 词汇（`text_delta`、`text_end` 等）。[Delta tracking §6](../01-delta/delta.md#6-there-is-no-frame-type) 不定义第二层 frame wrapper：进程内复制携带 `Op[]`，wire adapter 携带编码后的 `WireOp[]`。Pi-ai 帧在 fold 处停止；Chord 操作跨越复制边界。
 
-`AssistantMessageFrame` is pi-ai's own delta vocabulary and stays. What changes is
-that it is no longer the durable unit or the replication unit.
+`AssistantMessageFrame` 是 pi-ai 自己的 delta 词汇，应保持不变。改变的是：它不再是持久化单元或复制单元。
 
-The harness folds frames into `LaneView` by plain mutation. Under the Chord tracker that yields:
+Harness 通过普通 mutation 将帧折叠到 `LaneView`。在 Chord tracker 下会产生：
 
 ```json
 ["a",["operation","streamingMessage","content",0,"text"],"Let me "]
 ```
 
-Measured, interned ops are **smaller than frames** on this workload — 13.6 KB
-against 21.5 KB raw for 200 deltas — because a frame carries three keys of its own
-where an interned op carries one integer. So the size argument for putting frames
-on the wire is dead.
+在此工作负载上，测量得到的驻留操作**小于帧**——200 个 delta 的 raw 帧为 21.5 KB，而操作为 13.6 KB——因为一个帧自身携带三个 key，而驻留操作只携带一个整数。因此，在线路上传递帧的大小理由已经不成立。
 
-What frames keep is semantic: `text_end` carries authoritative content plus a
-signature in one atomic unit, where ops would need two with a weaker contract
-about their relationship. That is why they remain the *input* vocabulary and are
-folded before anything crosses a boundary.
+帧保留的是语义：`text_end` 在一个原子单元中携带权威内容和 signature；操作则需要两个，并且二者关系的契约更弱。因此帧仍是*输入*词汇，并在跨越任何边界前被折叠。
 
-### 5.2 Reducer state must live in the reduced value
+### 5.2 Reducer 状态必须位于被归约的值中
 
-Text and thinking fold purely: `block.text += frame.delta`, and `*_end` overwrites
-with authoritative content plus signature. The `ended` flag in `ReducerBlockState`
-is used only for validation and can be dropped.
+Text 和 thinking 的折叠是纯的：`block.text += frame.delta`，而 `*_end` 会用权威内容加 signature 覆盖。`ReducerBlockState` 中的 `ended` 标志只用于验证，可以删除。
 
-Tool calls cannot. `toolcall_delta` does `state.json += frame.delta`, accumulating
-a **raw JSON string that is never stored on the message** — the block holds
-`arguments`, the parsed value. You cannot recover the accumulator from the
-snapshot, and you cannot append a delta to a parsed object.
+Tool call 则不同。`toolcall_delta` 执行 `state.json += frame.delta`，累积一个**从未存入 message 的 raw JSON 字符串**——block 持有的是已解析的 `arguments`。无法从快照恢复累加器，也无法向已解析对象追加 delta。
 
-So the accumulator has to become part of the value being folded — e.g.
-`operation.frameState[contentIndex].json` on `LaneView` — leaving
-`AssistantMessage` clean. Generally:
+因此累加器必须成为被折叠 value 的一部分——例如 `LaneView` 上的 `operation.frameState[contentIndex].json`——而让 `AssistantMessage` 保持干净。一般原则是：
 
-> **A replicated reducer's state must be part of the replicated value.** Anything
-> held beside it diverges on any consumer that did not run the producer's fold.
+> **复制 reducer 的状态必须成为复制 value 的一部分。** 放在 value 旁边的任何状态，都会在没有执行生产者 fold 的消费者上发生分歧。
 
-The corollary is that `arguments` itself should **not** be replicated. It is
-derived from `json`, and a parsed object is a fresh reference on every parse, so
-storing both ships two copies of the same information. Derive it on demand.
+推论是 `arguments` 本身**不应该**复制。它从 `json` 派生，而每次 parse 都会产生新的引用，因此同时存储两者会发送同一信息的两份副本。按需派生即可。
 
-This is safe precisely because `parseStreamingJson` is **total** — four fallbacks
-ending in `{}`, it cannot throw — so a replica derives unconditionally with no
-error path and no agreement protocol. There is no parse-failure state to
-represent, and no block needs an error slot.
+这之所以安全，正是因为 `parseStreamingJson` 是**全函数**——四个 fallback 最终都会落到 `{}`，不会抛异常——因此 replica 可以无条件派生，不需要错误路径或一致性协议。没有需要表示的 parse-failure 状态，block 也不需要 error slot。
 
-### 5.3 Parse cost
+### 5.3 Parse 成本
 
-`parseStreamingJson` on a growing string once per delta is quadratic per message.
-Since `arguments` is now derived rather than replicated, this cost falls on whoever reads it rather than on every consumer. Presentation can refresh derived arguments at semantic checkpoints and `toolcall_end` instead of parsing on every delta; that policy is separate from why the encoder currently emits a checkpoint (§6).
+对增长中的字符串每个 delta 调用一次 `parseStreamingJson`，每条消息的成本是二次的。既然 `arguments` 现在是派生的而非复制的，这个成本会落在读取它的人身上，而不是每个消费者身上。Presentation 可以在语义检查点和 `toolcall_end` 时刷新派生参数，而不是每个 delta 都 parse；该策略与 encoder 当前发出检查点的原因是分开的（§6）。
 
-## 6. What `toolcall_checkpoint` is for
+## 6. `toolcall_checkpoint` 的用途
 
-`EncoderBlockState` carries `caughtUp` and `catchupJson` because a queued provider event's shared `partial` may already be ahead of that event's delta. The checkpoint catches the semantic frame stream up to the authoritative tool-call arguments visible at block start; it is not currently a general late-subscriber protocol.
+`EncoderBlockState` 持有 `caughtUp` 和 `catchupJson`，因为排队的 provider event 共享的 `partial` 可能已经领先于该 event 的 delta。检查点会让语义帧流追上 block start 时可见的权威工具调用参数；它目前不是通用的迟到订阅者协议。
 
-After frames fold into tracked state, a Chord root replacement (`r`) is the replication and durable-recovery resync point. `toolcall_checkpoint` remains semantic input to that fold rather than carrying transport responsibility.
+帧折叠到 tracked state 后，Chord 根替换（`r`）是复制和持久恢复的 resync 点。`toolcall_checkpoint` 仍是该 fold 的语义输入，而不是承担传输职责。
 
-## 7. Write volume for pending output
+## 7. Pending output 的写入量
 
-`openFrameProgress` calls `appendList(pendingAssistantFrames(...))`, so every
-frame is a line. A long response is thousands of writes.
+`openFrameProgress` 调用 `appendList(pendingAssistantFrames(...))`，因此每帧一行。长响应会产生数千次写入。
 
-**The address is renamed `pendingAssistantOutput`** and becomes a `list<WireOp[]>`, matching `pendingToolOutput` ([tool-output handoff §7.2](../04-tool-output/harness-tools.md#72-renaming)), and it stops being a list of frames. The progress sink encodes tracked `Op[]` with one stateful encoder per response before appending each durable `WireOp[]` batch; explicit `rebase()` calls produce bounded root-replacement batches for recovery. The list lives in an **ephemeral scope** so it is unlinked on settle rather than persisting in the main log ([scoped storage](../02-scopes/scopes.md)).
+**地址改名为 `pendingAssistantOutput`**，并改为 `list<WireOp[]>`，与 `pendingToolOutput` 一致（[tool-output handoff §7.2](../04-tool-output/harness-tools.md#72-renaming)），不再是帧列表。Progress sink 会在每次追加 durable `WireOp[]` 批次前，使用每个响应一个有状态 encoder 对 tracked `Op[]` 编码；显式 `rebase()` 调用会为恢复产生有界的根替换批次。该列表位于**临时作用域**，因此结算时会解除链接，而不是持久在主日志中（[scoped storage](../02-scopes/scopes.md)）。
 
-The important property is that this list is **not history**: `deleteList` runs on
-settle in `response.ts`, `deferred.ts`, and `terminal.ts`. It exists so a crash
-mid-response can recover a partial assistant message. The settled message is persisted
-separately.
+重要属性是：这个列表**不是历史**：`response.ts`、`deferred.ts` 和 `terminal.ts` 会在结算时运行 `deleteList`。它存在的目的，是让响应中途崩溃时可以恢复局部 assistant 消息。已结算消息会单独持久化。
 
-That means per-frame durability buys almost nothing, and the write rate can be traded
-away directly:
+这意味着逐帧持久化几乎没有收益，而且可以直接牺牲写入频率：
 
-- **Coalesce with a bounded, non-resetting window.** The first pending frame opens the
-  window; later frames join it *without* extending the deadline, so a continuously
-  streaming response cannot postpone the first write indefinitely — the failure mode a
-  naive debounce has. Frames admitted during an active write form the next batch.
-- **Concatenate on flush.** A run of `text_delta` frames for one `contentIndex`
-  collapses to a single frame with the joined text. The fold result is identical, so
-  this is lossless for our purposes.
+- **使用有界且不重置的窗口合并。** 第一帧 pending 会打开窗口；后续帧加入窗口但*不会*延长 deadline，因此持续流式响应不会无限期推迟第一次写入——这正是简单 debounce 的失败模式。active write 期间准入的帧会形成下一批。
+- **刷新时拼接。** 一个 `contentIndex` 上连续的 `text_delta` 帧会折叠为一个、文本已连接的帧。折叠结果相同，因此对我们而言这是无损的。
 
-A crash then loses at most one window of in-flight streaming.
+因此一次崩溃最多丢失一个正在传输的窗口。
 
-### 7.1 Contrast with DeepSeek Harness
+### 7.1 与 DeepSeek Harness 的对比
 
-DSH cannot make this trade. Its `assistant/chunk` events are canonical log entries, so
-per-token durability is mandatory and it attacks size instead:
+DSH 无法采用这种权衡。它的 `assistant/chunk` 事件是规范日志条目，因此必须逐 token 持久化，解决方案是降低大小：
 
-- the same bounded non-resetting write-behind window;
-- **packed rows** — runs of consecutive chunk deltas stored as
-  `text-chunks` / `reasoning-chunks` / `tool-call-chunks`, lossless and roughly 60%
-  smaller on a real session, with reading unconditional so layout never depends on the
-  write switch;
-- checksummed zstd frames by default, with recovery from a torn final frame.
+- 同样的有界且不重置的 write-behind 窗口；
+- **打包行**——连续 chunk delta 存储为 `text-chunks`/`reasoning-chunks`/`tool-call-chunks`，无损；在真实 session 上约小 60%，读取路径无条件处理，因此布局不会依赖写入开关；
+- 默认使用带校验和的 zstd 帧，并能从末尾被截断的帧恢复。
 
-Their packing must reconstruct exact event boundaries, sequence numbers and timestamps,
-because `seq = log.length` and validation requires a contiguous logical log. Ours does
-not, because the frames are discarded at settle — so plain concatenation is available
-to us and packing machinery is not needed.
+它们的打包必须重建精确的事件边界、序列号和时间戳，因为 `seq = log.length`，验证要求逻辑日志连续。我们的情况不同：帧会在结算时丢弃，因此可以直接拼接，不需要打包机制。
 
-## 8. Consequence for ad-hoc listeners
+## 8. 对临时 listener 的影响
 
-`HarnessEvent.message_update` stops being self-describing. A listener that attaches
-mid-stream sees a delta against a partial it does not hold.
+`HarnessEvent.message_update` 不再自描述。中途附加的 listener 看到的是相对于它未持有的 partial 的 delta。
 
-Any correct listener already has the base, because `watch()` installs the subscription
-and captures the snapshot inside one `readLane` critical section, buffering until
-`start()`. But a listener that calls `on("message_update")` directly, without a watch,
-is no longer viable — worth knowing before committing.
+任何正确的 listener 已经拥有 base，因为 `watch()` 会安装订阅，并在一个 `readLane` critical section 中捕获快照，直到 `start()` 前持续缓冲。但直接调用 `on("message_update")`、不经过 watch 的 listener 将不再可用；在 commit 前需要了解这一点。
