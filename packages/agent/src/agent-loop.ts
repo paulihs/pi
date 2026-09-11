@@ -305,10 +305,14 @@ async function runLoop(
 		if (followUpMessages.length > 0) {
 			// 放入待处理队列，让内层循环继续处理
 			pendingMessages = followUpMessages;
+			continue;
 		}
 
 		// 没有更多消息，退出
+		break;
 	}
+
+	await emit({ type: "agent_end", messages: newMessages });
 }
 
 /**
