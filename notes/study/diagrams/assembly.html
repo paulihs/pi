@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi 装配图 · 从 main() 到第一次 prompt</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #e6e9ef;
+    --muted: #8b94a7; --accent: #7aa2f7; --accent2: #9ece6a; --warn: #e0af68;
+    --card: #1d2129; --shadow: 0 6px 24px rgba(0,0,0,.35);
+  }
+  html[data-theme="light"] {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #d9dde5; --text: #1b1f27;
+    --muted: #5d6678; --accent: #2f5fd0; --accent2: #2f7d32; --warn: #9a6700;
+    --card: #ffffff; --shadow: 0 6px 20px rgba(16,24,40,.08);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 18px 24px;
+    border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  .tabs { display: flex; gap: 6px; }
+  .tab {
+    border: 1px solid var(--line); background: transparent; color: var(--muted);
+    padding: 6px 12px; border-radius: 999px; cursor: pointer; font-size: 13px;
+  }
+  .tab[aria-selected="true"] { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .theme {
+    border: 1px solid var(--line); background: transparent; color: var(--muted);
+    padding: 6px 10px; border-radius: 8px; cursor: pointer; font-size: 12px;
+  }
+  main { display: grid; grid-template-columns: minmax(420px, 1fr) 380px; gap: 20px; padding: 24px; align-items: start; }
+  @media (max-width: 920px) { main { grid-template-columns: 1fr; } }
+
+  .canvas { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; box-shadow: var(--shadow); }
+  .lane { display: flex; flex-direction: column; gap: 0; }
+  .lane + .lane { margin-top: 4px; }
+  .lane-label { color: var(--muted); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; margin: 4px 0 8px 2px; }
+  .node {
+    position: relative; display: grid; grid-template-columns: 96px 1fr; gap: 12px;
+    border: 1px solid var(--line); background: var(--card); border-radius: 10px;
+    padding: 10px 12px; cursor: pointer; transition: border-color .15s, transform .15s;
+  }
+  .node:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+  .node[aria-current="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent); }
+  .node .k { color: var(--muted); font-size: 12px; }
+  .node .t { font-weight: 600; font-size: 13.5px; }
+  .node .d { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .node .path { color: var(--accent2); font-size: 11.5px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .node.side { border-left: 3px solid var(--warn); }
+  .arrow { height: 22px; margin-left: 44px; border-left: 1px dashed var(--line); position: relative; }
+  .arrow::after {
+    content: ""; position: absolute; left: -4px; bottom: -1px;
+    border: 4px solid transparent; border-top-color: var(--line);
+  }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); color: var(--muted); }
+  aside {
+    position: sticky; top: 86px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 18px; box-shadow: var(--shadow); min-height: 260px;
+  }
+  aside h2 { margin: 0 0 6px; font-size: 14px; }
+  aside .where { color: var(--accent2); font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  aside p { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
+  aside ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+  aside li + li { margin-top: 6px; }
+  code { background: color-mix(in srgb, var(--accent) 12%, transparent); padding: 1px 5px; border-radius: 5px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 14px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .hidden { display: none; }
+  footer { color: var(--muted); font-size: 12px; padding: 0 24px 28px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>pi 装配图</h1>
+    <div class="sub">main@2c8d1feb1 · 点节点看代码位置</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-view="assembly" aria-selected="true">装配链路</button>
+    <button class="tab" role="tab" data-view="tools" aria-selected="false">工具注册</button>
+    <button class="tab" role="tab" data-view="inject" aria-selected="false">Skill / MCP 注入</button>
+  </div>
+  <button class="theme" id="theme">明暗</button>
+</header>
+
+<main>
+  <section class="canvas" id="canvas"></section>
+  <aside id="detail">
+    <h2>选一个节点</h2>
+    <p>左图里的每个方块都对应仓库里的一段真实代码。点一下，这里显示它负责什么、为什么这么分。</p>
+  </aside>
+</main>
+
+<footer>
+  图基于 packages/coding-agent 与 packages/agent 的实际代码生成。文字版见 notes/study/01-assembly.md、02-tools.md、03-skills.md、04-mcp.md。
+</footer>
+
+<script>
+const VIEWS = {
+  assembly: {
+    title: "装配链路",
+    lanes: [
+      { label: "入口", nodes: [
+        { id: "main", k: "CLI", t: "main.ts", d: "解析参数、选模式、拼扩展清单", path: "packages/coding-agent/src/main.ts:578",
+          body: "四种模式（interactive / rpc / json / print）共用同一个 createAgentSession。区别只在 bindExtensions() 传进去的 UI 上下文。",
+          bullets: ["extensionFactories = [llama.cpp, codemode, tool-search, mcp]", "--no-mcp 在这里把 mcp 加进 disabledBuiltinExtensions"] }
+      ]},
+      { label: "装配层 sdk.ts", nodes: [
+        { id: "sdk", k: "sdk.ts:191", t: "createAgentSession()", d: "把六个基础对象拼起来", path: "packages/coding-agent/src/core/sdk.ts:191",
+          body: "ModelRuntime、SettingsManager、SessionManager、DefaultResourceLoader 都可注入。resourceLoader.reload() 是唯一接触磁盘资源的地方。",
+          bullets: ["模型恢复顺序：会话条目 > 设置默认 > 报错", "思考等级最后一定过 clampThinkingLevel(model, level)"] },
+        { id: "toolsel", k: "决策", t: "工具名集合", d: "tools / noTools / excludeTools", path: "packages/coding-agent/src/core/sdk.ts:280",
+          body: "这里只算名字，不算工具对象。+name/-name 是增量调整，普通数组是白名单。",
+          bullets: ["只有 +name 和 -name 的列表不会被当成白名单", "真正生成工具对象在 AgentSession._applyToolLoadout()"] },
+        { id: "agentnew", k: "new Agent", t: "Agent（循环层）", d: "systemPrompt 传空串，提示词稍后补", path: "packages/coding-agent/src/core/sdk.ts:403",
+          body: "Agent 不认识 provider，也不认识磁盘。它只拿到一个 streamFn 函数指针和 initialState。",
+          bullets: ["streamFn 里包了超时、重试、identity、before_provider_headers", "CacheWarmer 只在 sessionId 匹配时启动"] }
+      ]},
+      { label: "会话层 agent-session.ts", nodes: [
+        { id: "sessnew", k: "new AgentSession", t: "订阅 + 钩子", d: "持久化、扩展、压缩全挂在事件上", path: "packages/coding-agent/src/core/agent-session.ts:527",
+          body: "构造时做三件事：agent.subscribe、_installAgentToolHooks、_buildRuntime。之后所有行为都是事件驱动的。",
+          bullets: ["tool_call / tool_result 拦截在 AgentSession，不在 wrapper", "五个 install* 钩子分别管下一轮刷新、请求投影、边界、隐藏声明、强制提示词"] },
+        { id: "reg", k: "合并", t: "工具注册表", d: "内置 + 扩展 + customTools", path: "packages/coding-agent/src/core/agent-session.ts:3576",
+          body: "产出两张表：definitionRegistry（提示词/UI/校验用）和 _toolRegistry（agent loop 执行用）。",
+          bullets: ["先内置后扩展，同名扩展覆盖内置", "wrapToolDefinition() 把 definition 派生为 AgentTool，并注入 tool context"] },
+        { id: "prompt", k: "提示词", t: "section 补丁", d: "不是整串替换，是增量 diff", path: "packages/coding-agent/src/core/system-prompt.ts:216",
+          body: "提示词拆成有名字的段：preamble/tools/rules/docs/skills/cwd。改动时只追加变化的那几段。",
+          bullets: ["SystemMessage 的 content 是空串，sections 承载内容", "回放时按顺序合并 sections，得到当前完整提示词", "目的：不让整段前缀失效，保住 prompt cache"] }
+      ]},
+      { label: "请求时", nodes: [
+        { id: "loop", k: "runLoop", t: "agent loop", d: "一轮轮跑模型和执行工具", path: "packages/agent/src/agent-loop.ts",
+          body: "外层等 follow-up，内层处理 tool call 和 steering。工具集变化会先发一条 system 消息声明增删。",
+          bullets: ["stopReason=error/aborted 直接结束", "stopReason=length 时本轮所有工具调用都不执行"] },
+        { id: "call", k: "provider", t: "streamFn", d: "streamFn(model, context, options)", path: "packages/coding-agent/src/core/sdk.ts:412",
+          body: "这是装配层注入的出口。之前还有 transformContext 和 convertToLlm 两道过滤。",
+          bullets: ["自定义消息在这里被 defaultConvertToLlm 过滤掉", "blockImages 设置会在这里把图片换成占位文本"] }
+      ]}
+    ]
+  },
+  tools: {
+    title: "工具注册",
+    lanes: [
+      { label: "五个来源", nodes: [
+        { id: "builtin", k: "1", t: "内置工具", d: "read bash edit write grep find ls powershell", path: "packages/coding-agent/src/core/tools/index.ts",
+          body: "每个工具一个文件，导出 createXTool 和 createXToolDefinition 两个工厂。cwd 必须传，因为路径要按会话目录解析。",
+          bullets: ["createCodingToolDefinitions → read/bash/edit/write", "createReadOnlyToolDefinitions → read/grep/find/ls"] },
+        { id: "override", k: "2", t: "baseToolsOverride", d: "整体替换内置工具表", path: "packages/coding-agent/src/core/agent-session.ts:3732",
+          body: "只替换内置层，扩展工具照常合并。用于只读沙箱、容器内执行。",
+          bullets: ["默认激活集合变成 Object.keys(baseToolsOverride)"] },
+        { id: "custom", k: "3", t: "customTools", d: "SDK 直接给 ToolDefinition[]", path: "packages/coding-agent/src/core/sdk.ts:94",
+          body: "不写扩展文件，进程内传。sourceInfo 会被合成成 <sdk:name>。",
+          bullets: ["适合宿主程序自己的少数工具"] },
+        { id: "ext", k: "4", t: "pi.registerTool()", d: "扩展的正式接口", path: "packages/coding-agent/src/core/extensions/types.ts:1695",
+          body: "磁盘扩展、内建扩展、内联扩展都走这里。注册后由 runner 统一收集。",
+          bullets: ["同名字会覆盖内置", "还能注册命令、快捷键、工具渲染器"] },
+        { id: "mcp", k: "5", t: "MCP 工具", d: "session_start 时批量注册", path: "packages/coding-agent/src/extensions/mcp/index.ts:279",
+          body: "不是手动注册。内建 mcp 扩展连上服务器后，把每个工具包成 mcp__<server>__<tool> 注册进来。",
+          bullets: ["默认 exposure=codemode，所以默认不进模型上下文"] }
+      ]},
+      { label: "合并与激活", nodes: [
+        { id: "merge", k: "Map", t: "definitionRegistry", d: "定义层：给提示词、给 UI、给校验", path: "packages/coding-agent/src/core/agent-session.ts:3608",
+          body: "提示词片段（promptSnippet/promptGuidelines）从这里提取；渲染器也从这里找。",
+          bullets: ["先放内置，再放扩展/custom，同名覆盖"] },
+        { id: "wrap", k: "wrap", t: "_toolRegistry", d: "执行层：给 agent loop 的 AgentTool", path: "packages/coding-agent/src/core/extensions/wrapper.ts",
+          body: "wrapToolDefinition(definition, ctx => runner.createToolContext(...))。扩展工具因此能拿到 ctx.executeTool() 和 ctx.ui。",
+          bullets: ["只有这张表里的工具才能被真正执行"] },
+        { id: "activate", k: "loadout", t: "_applyToolLoadout()", d: "决定哪些工具声明给模型", path: "packages/coding-agent/src/core/agent-session.ts:1614",
+          body: "过滤 hidden、跑 prepareLoadout、赋值给 agent.state.tools。注册≠可见，差别就在这一步。",
+          bullets: ["prepareLoadout 可改描述、可隐藏声明"] }
+      ]},
+      { label: "五种 exposure", nodes: [
+        { id: "exp", k: "类型", t: "direct / model-only / codemode / deferred / hidden", d: "模型怎么够到这个工具", path: "packages/coding-agent/src/core/extensions/types.ts:536",
+          body: "direct 和 model-only 注册即激活；codemode 注册即可被脚本调用但不声明；deferred 只能被 tool_search 找出来；hidden 不可达。",
+          bullets: ["model-only：声明给模型但别的工具调不到", "codemode：脚本能调，模型看不到"] }
+      ]},
+      { label: "执行时", nodes: [
+        { id: "hook", k: "hooks", t: "beforeToolCall / afterToolCall", d: "接到扩展的 tool_call / tool_result 事件", path: "packages/coding-agent/src/core/agent-session.ts:668",
+          body: "返回 block 就不执行；返回 terminate 让本轮结束。afterToolCall 能改 content/details/isError，字段级替换。",
+          bullets: ["并行是默认，串行要显式 executionMode: sequential"] }
+      ]}
+    ]
+  },
+  inject: {
+    title: "Skill / MCP 注入",
+    lanes: [
+      { label: "Skill", nodes: [
+        { id: "skfind", k: "发现", t: "loadSkills()", d: "扫 user / project / explicit 三类目录", path: "packages/coding-agent/src/core/skills.ts:414",
+          body: "递归找 SKILL.md，有 SKILL.md 的目录就不再往下钻。符号链接解析后去重，同名保留先加载的。",
+          bullets: ["~/.pi/agent/skills/", "<cwd>/.pi/skills/", "扩展可通过 resources_discover 贡献 skillPaths"] },
+        { id: "skfmt", k: "索引", t: "formatSkillsForPrompt()", d: "只放 name / description / location", path: "packages/coding-agent/src/core/skills.ts:358",
+          body: "正文不进提示词。模型看到的是 <available_skills> 索引，需要时用 read 工具按 location 去读 SKILL.md。",
+          bullets: ["一份 skill 正文可能几千 token，几十个就把上下文吃光", "索引稳定，前缀不变，prompt cache 一直命中"] },
+        { id: "sksec", k: "落地", t: "skills section", d: "进 <skills> 段，随其他段一起 diff", path: "packages/coding-agent/src/core/system-prompt.ts:178",
+          body: "read/bash 都被隐藏时，引导语退化成不点名工具的版本，索引仍保留。",
+          bullets: ["disable-model-invocation: true 的技能不列出来"] }
+      ]},
+      { label: "MCP", nodes: [
+        { id: "mcpreg", k: "内建扩展", t: "builtInExtensions", d: "llama.cpp / codemode / tool-search / mcp", path: "packages/coding-agent/src/extensions/index.ts:7",
+          body: "replaceable: true 表示第三方扩展可以接管同名能力，不会两个一起跑。--no-mcp 关闭它。",
+          bullets: ["SDK 默认不含这些，需要手动放进 extensionFactories"] },
+        { id: "mcpconn", k: "连接", t: "session_start", d: "读 mcp.json + 扩展登记，后台并发连接", path: "packages/coding-agent/src/extensions/mcp/index.ts:279",
+          body: "第一个 prompt 只等带 direct 工具的服务器，默认 10 秒。codemode 脚本和 tool_search 在真正需要时才等。",
+          bullets: ["mcp.json 同名服务器优先于代码登记", "失败只报告一次，/mcp 里可见"] },
+        { id: "mcpname", k: "命名", t: "mcp__<server>__<tool>", d: "server 里的 - 换成 _", path: "packages/coding-agent/src/core/mcp-servers.ts:168",
+          body: "命名空间是 mcp__<server>，别名是原始 server 名。服务器 instructions 只给 describeNamespace()，不进提示词。",
+          bullets: ["重连后工具名保持稳定"] },
+        { id: "mcpexp", k: "暴露", t: "exposure 默认 codemode", d: "不声明给模型，只给脚本调用", path: "packages/coding-agent/src/core/mcp-servers.ts:253",
+          body: "装十个服务器不会把几十个工具塞进系统提示词。要直连就配 direct，要 tool_search 找就用 deferred。",
+          bullets: ["toolExposure 支持通配覆盖单个工具", "hidden 等于从模型视角移除"] }
+      ]}
+    ]
+  }
+};
+
+const canvas = document.getElementById("canvas");
+const detail = document.getElementById("detail");
+let currentView = "assembly";
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+
+function render(viewKey) {
+  currentView = viewKey;
+  const view = VIEWS[viewKey];
+  const parts = [];
+  view.lanes.forEach((lane, li) => {
+    if (li > 0) parts.push('<div class="arrow"></div>');
+    parts.push(`<div class="lane"><div class="lane-label">${esc(lane.label)}</div>`);
+    const multi = lane.nodes.length > 1;
+    parts.push(`<div class="${multi ? (lane.nodes.length > 2 ? "grid3" : "grid2") : ""}">`);
+    for (const n of lane.nodes) {
+      parts.push(`<div class="node${n.side ? " side" : ""}" data-id="${esc(n.id)}" aria-current="false">
+        <div class="k">${esc(n.k)}</div>
+        <div>
+          <div class="t">${esc(n.t)}</div>
+          <div class="d">${esc(n.d)}</div>
+          <div class="path">${esc(n.path)}</div>
+        </div>
+      </div>`);
+    }
+    parts.push("</div></div>");
+  });
+  canvas.innerHTML = parts.join("");
+  canvas.querySelectorAll(".node").forEach(el => {
+    el.addEventListener("click", () => select(el.dataset.id));
+  });
+  const first = canvas.querySelector(".node");
+  if (first) select(first.dataset.id);
+}
+
+function select(id) {
+  const view = VIEWS[currentView];
+  let node;
+  for (const lane of view.lanes) {
+    const hit = lane.nodes.find(n => n.id === id);
+    if (hit) { node = hit; break; }
+  }
+  if (!node) return;
+  canvas.querySelectorAll(".node").forEach(el => {
+    el.setAttribute("aria-current", el.dataset.id === id ? "true" : "false");
+  });
+  detail.innerHTML = `
+    <h2>${esc(node.t)}</h2>
+    <div class="where">${esc(node.path)}</div>
+    <p>${esc(node.body)}</p>
+    <ul>${(node.bullets || []).map(b => `<li>${esc(b)}</li>`).join("")}</ul>
+  `;
+}
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", "false"));
+    tab.setAttribute("aria-selected", "true");
+    render(tab.dataset.view);
+  });
+});
+
+document.getElementById("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
+});
+
+render("assembly");
+</script>
+</body>
+</html>

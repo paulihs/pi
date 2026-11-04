@@ -135,6 +135,15 @@ Attribution:
 
 For release preparation, publishing, verification, or recovery, load and follow [.pi/skills/release.md](.pi/skills/release.md).
 
+## Study Notes
+
+`notes/study/` is a personal learning collection about how pi works. It is not upstream documentation.
+
+- When the user asks to "record" or "write down" something about how pi works, write it into the matching file under `notes/study/` and update the index in `notes/study/README.md` in the same edit. Do not leave it only in the chat.
+- Files are split by topic (`01-assembly.md`, `02-tools.md`, `03-skills.md`, `04-mcp.md`). Add new topics as `NN-topic.md` and list them in the index. Cross-cutting architecture notes go in `notes/pi-architecture.md`.
+- Check every code path and line number against the current HEAD, and state the base commit in the file header.
+- Leave notes uncommitted unless the user asks to commit them.
+
 ## User Override
 
 If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.
