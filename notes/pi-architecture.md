@@ -23,17 +23,19 @@ pi 不是一个单体 agent，而是四层加一圈外围：
 
 ## 1. 分层与依赖方向
 
+有两条并行的栈，不是一个四层金字塔：
+
 ```
-coding-agent   ← CLI / SDK / RPC / interactive
-    ↓
-durable        ← 会话、任务、文档、恢复
-    ↓
-agent          ← turn 循环
-    ↓
-ai             ← 协议与模型目录
+coding-agent ──→ agent ──→ ai
+                             ↑
+              durable ───────┘   (durable 不依赖 agent)
 ```
 
-依赖单向，`ai` 不知道 `agent` 存在，`agent` 不知道 `durable` 存在。这条纪律是后面所有可替换性的前提：可以只要 `ai` 做流式调用，可以只要 `agent` 配自研存储，也可以用 `durable` 拿到完整恢复能力。
+- `coding-agent` 的 workspace 依赖：`pi-agent-core`、`pi-ai`、`pi-codemode`、`pi-mcp`、`pi-tui`。
+- `durable` 的 workspace 依赖：`chord`、`pi-ai`、`pi-codemode`、`pi-telemetry`。**它不 import `pi-agent-core`**，自己在 `packages/durable/src/harness/generation.ts` 里跑生成状态机，模型调用在 `generation.ts:740` 的 `runtime.models.streamSimple(...)`。
+- `agent` 只依赖 `pi-ai`。`ai` 谁都不依赖（只依赖 telemetry）。
+
+所以不要把 durable 当成 coding-agent 的下层：交互式 CLI 用 `Agent` 类跑循环；需要事务、崩溃恢复、任务图的那条路用 durable，两边共享的只有 `pi-ai` 的协议和模型目录。这条纪律是后面所有可替换性的前提：可以只要 `ai` 做流式调用，可以只要 `agent` 配自研存储，也可以用 `durable` 拿到完整恢复能力。
 
 ## 2. pi-ai：模型访问层
 
