@@ -18,6 +18,7 @@
 
 | 文档 | 回答的问题 |
 |---|---|
+| [00-reading-checklist.md](00-reading-checklist.md) | 从会话初始化到 Skill / Tool / MCP 加载、模型上下文和工具结果回传的源码阅读清单 |
 | [01-assembly.md](01-assembly.md) | 一个会话是怎么被拼出来的：`main()` → `createAgentSession()` → `Agent` → `AgentSession`，提示词如何以"补丁"形式进 transcript |
 | [02-tools.md](02-tools.md) | 工具有几种注册方式、注册和"模型可见"差在哪、五种 exposure 各是什么、调用拦截链 |
 | [03-skills.md](03-skills.md) | skill 长什么样、从哪儿发现、为什么提示词里只放索引、正文怎么按需加载 |
